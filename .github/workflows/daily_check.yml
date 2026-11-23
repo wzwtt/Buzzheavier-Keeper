@@ -31,7 +31,7 @@ on:
       retries:
         description: 'Max retries on transient Cloudflare challenges'
         required: false
-        default: '3'
+        default: '8'
         type: string
       soft_fail:
         description: 'Do not fail workflow if dead/expired (404) links are found'
@@ -94,7 +94,7 @@ jobs:
           SHARD_ARG="${{ matrix.shard }}/${{ needs.init-matrix.outputs.total_shards }}"
           DELAY_ARG="${{ inputs.delay || '1.0' }}"
           WORKERS_ARG="${{ inputs.workers || '1' }}"
-          RETRIES_ARG="${{ inputs.retries || '3' }}"
+          RETRIES_ARG="${{ inputs.retries || '8' }}"
           SOFT_FAIL_FLAG="${{ (inputs.soft_fail != false) && '--soft-fail' || '' }}"
 
           python get_download_link.py links.txt -l \
