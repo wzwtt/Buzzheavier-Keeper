@@ -2,6 +2,18 @@
 """
 BuzzHeavier Download Link Resolver (curl-cffi edition)
 Fast, lightweight link resolver and downloader for BuzzHeavier files using TLS fingerprint impersonation.
+
+Anti-Cloudflare design notes (v2):
+- Uses the *latest* browser fingerprint via aliases ("chrome") and rotates among
+  recently-pinned targets that are validated against the installed curl_cffi version.
+- Persists browser sessions (cookies incl. Cloudflare __cf_bm) across attempts and links
+  via a thread-local session pool, with a homepage "warm-up" so the first file-page hit
+  never looks like a cold, cookieless bot visit.
+- Detects Cloudflare challenges reliably: status codes, response HTML markers AND the
+  `cf-mitigated: challenge` response header.
+- Retries with exponential backoff + jitter; rate-limits (429) get doubled cool-downs.
+- Optional HTTP/SOCKS proxy support (--proxy / BH_PROXY env) — recommended when running
+  from datacenter IPs such as GitHub Actions runners, which Cloudflare scores poorly.
 """
 
 import sys
@@ -35,6 +47,67 @@ except ImportError:
     BeautifulSoup = None
 
 
+BASE_URL = "https://buzzheavier.com"
+WARMUP_URL = "https://buzzheavier.com/"
+
+# ---------------------------------------------------------------------------
+# Impersonation target management
+# ---------------------------------------------------------------------------
+
+# Preferred rotation order: newest Chromium first (best Cloudflare reputation),
+# then a couple of non-Chromium profiles as last-resort identity switches.
+PREFERRED_TARGETS = [
+    "chrome",        # alias -> always newest Chrome profile shipped with curl_cffi
+    "chrome152", "chrome151", "chrome146", "chrome145", "chrome142",
+    "chrome136", "chrome133a", "chrome131", "chrome124",
+    "safari184", "safari184_ios", "firefox147", "firefox144",
+]
+
+_SUPPORTED_TARGETS_CACHE: Optional[set] = None
+
+
+def get_supported_impersonate_targets() -> Optional[set]:
+    """Returns the set of impersonate targets supported by the installed curl_cffi, or None if it cannot be introspected."""
+    global _SUPPORTED_TARGETS_CACHE
+    if _SUPPORTED_TARGETS_CACHE is not None:
+        return _SUPPORTED_TARGETS_CACHE
+    targets = None
+    try:
+        from curl_cffi.requests.impersonate import BrowserTypeLiteral
+        import typing
+        targets = set(typing.get_args(BrowserTypeLiteral))
+    except Exception:
+        targets = None
+    if not targets:
+        try:
+            from curl_cffi.consts import BrowserType  # older curl_cffi versions
+            targets = set(BrowserType.__members__.keys())
+        except Exception:
+            targets = None
+    _SUPPORTED_TARGETS_CACHE = targets
+    return targets
+
+
+def build_candidate_targets(primary: Optional[str]) -> List[str]:
+    """Builds a validated fingerprint rotation list for the installed curl_cffi version."""
+    candidates: List[str] = []
+    if primary:
+        candidates.append(primary)
+    for alt in PREFERRED_TARGETS:
+        if alt not in candidates:
+            candidates.append(alt)
+
+    supported = get_supported_impersonate_targets()
+    if supported:
+        valid = [t for t in candidates if t in supported]
+        # If the requested primary is unsupported, silently fall back to valid ones
+        return valid or ["chrome"]
+
+    # Without introspection (very old curl_cffi), keep the list but callers
+    # handle per-target failures gracefully.
+    return candidates
+
+
 def parse_file_id(input_val: str) -> str:
     """Extract file ID from raw ID or full BuzzHeavier URL."""
     input_val = input_val.strip()
@@ -47,38 +120,170 @@ def parse_file_id(input_val: str) -> str:
     raise ValueError(f"Could not extract a valid file ID from: {input_val}")
 
 
-def is_cloudflare_challenge(status_code: int, html_text: str) -> bool:
-    """Checks if HTTP status or HTML response indicates a Cloudflare challenge or rate-limit."""
+# ---------------------------------------------------------------------------
+# Response classification (Cloudflare challenge / rate limit / transient)
+# ---------------------------------------------------------------------------
+
+CF_MARKERS = (
+    "just a moment...",
+    "attention required! | cloudflare",
+    "cf-chl-bypass",
+    "cf-turnstile",
+    "checking your browser before accessing",
+    "enable javascript and cookies to continue",
+    "ddos protection by cloudflare",
+)
+
+TRANSIENT_STATUS = (403, 408, 409, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 527)
+
+
+def classify_response(resp) -> str:
+    """Classifies a response as 'ok' / 'not_found' / 'challenge' / 'rate_limited' / 'transient' / 'other'."""
+    status = resp.status_code
+    if status in (404, 410):
+        return "not_found"
+
+    # Cloudflare explicitly tells us it served a challenge/managed block
+    try:
+        cf_mitigated = (resp.headers.get("cf-mitigated") or "").lower()
+    except Exception:
+        cf_mitigated = ""
+    if cf_mitigated in ("challenge", "block"):
+        return "challenge"
+
+    if status in (403, 429):
+        return "rate_limited" if status == 429 else "challenge"
+
+    if status in (500, 502, 503, 504, 520, 521, 522, 523, 524):
+        return "transient"
+
+    text = ""
+    try:
+        text = (resp.text or "")[:8192].lower()
+    except Exception:
+        pass
+    if text and any(marker in text for marker in CF_MARKERS):
+        return "challenge"
+
+    if status == 200:
+        return "ok"
+    if status in (204, 206, 301, 302, 303, 307, 308):
+        return "ok"
+    if status in TRANSIENT_STATUS:
+        return "transient"
+    return "other"
+
+
+def is_cloudflare_challenge(status_code: int, html_text: str, headers: Optional[Dict[str, str]] = None) -> bool:
+    """Backwards-compatible challenge check (kept for external callers/tests)."""
     if status_code in (403, 429, 503):
+        return True
+    if headers and (headers.get("cf-mitigated") or "").lower() in ("challenge", "block"):
         return True
     if not html_text:
         return False
     lower = html_text.lower()
-    cf_markers = (
-        "just a moment...",
-        "attention required! | cloudflare",
-        "cf-chl-bypass",
-        "cf-turnstile",
-        "checking your browser before accessing",
-        "enable javascript and cookies to continue",
-        "ddos protection by cloudflare",
-    )
-    return any(marker in lower for marker in cf_markers)
+    return any(marker in lower for marker in CF_MARKERS)
 
+
+# ---------------------------------------------------------------------------
+# Session management (thread-local pool + warm-up)
+# ---------------------------------------------------------------------------
+
+_thread_ctx = threading.local()
+
+PROXY_ENV_VARS = ("BH_PROXY", "BUZZHEAVIER_PROXY", "PROXY_URL")
+
+
+def get_proxy_from_env() -> Optional[str]:
+    for var in PROXY_ENV_VARS:
+        val = os.environ.get(var)
+        if val and val.strip():
+            return val.strip()
+    return None
+
+
+def proxies_dict(proxy_url: Optional[str]) -> Optional[Dict[str, str]]:
+    if not proxy_url:
+        return None
+    return {"http": proxy_url, "https": proxy_url}
+
+
+def make_session(impersonate: str, proxy_url: Optional[str] = None, warm_up: bool = True, timeout: int = 20):
+    """Creates an impersonated session, optionally 'warming it up' on the homepage so
+    that Cloudflare bot-management cookies (__cf_bm) are already in the jar."""
+    session = requests.Session(impersonate=impersonate, proxies=proxies_dict(proxy_url))
+    if warm_up:
+        try:
+            session.get(WARMUP_URL, timeout=timeout)
+        except Exception:
+            pass  # warm-up is best-effort; the real request will still be retried
+    return session
+
+
+def get_thread_session(primary_impersonate: str, proxy_url: Optional[str], timeout: int = 20):
+    """Returns a long-lived session for the current worker thread, creating and warming it up on first use."""
+    session = getattr(_thread_ctx, "session", None)
+    if session is None:
+        session = make_session(primary_impersonate, proxy_url=proxy_url, timeout=timeout)
+        _thread_ctx.session = session
+    return session
+
+
+def reset_thread_session(primary_impersonate: str, proxy_url: Optional[str], timeout: int = 20):
+    """Discards the current thread session (e.g. after repeated challenges) and returns a fresh warmed one."""
+    _thread_ctx.session = make_session(primary_impersonate, proxy_url=proxy_url, timeout=timeout)
+    return _thread_ctx.session
+
+
+# ---------------------------------------------------------------------------
+# Link resolution
+# ---------------------------------------------------------------------------
+
+XHR_HEADERS = {
+    "HX-Request": "true",
+    "Referer": BASE_URL,
+    "HX-Current-URL": BASE_URL,
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
+}
+
+CDN_URL_RE = re.compile(r'^https?://[a-z0-9.-]*buzzheavier\.com/.+', re.IGNORECASE)
+
+
+def _looks_like_cdn(url: str) -> bool:
+    return bool(url) and bool(CDN_URL_RE.match(url)) and ("/d/" in url or "download" in url)
+
+
+def backoff_seconds(attempt: int, base: float, kind: str) -> float:
+    """Exponential backoff with jitter; rate-limits (429) get a doubled cool-down."""
+    wait = base * (2 ** max(0, attempt - 1))
+    if kind == "rate_limited":
+        wait *= 2
+    wait = min(wait, 60.0)
+    return wait + random.uniform(0.5, 1.5)
 
 
 def resolve_buzzheavier_link(
     file_id: str,
-    impersonate: str = "chrome124",
-    timeout: int = 15,
+    impersonate: Optional[str] = "chrome",
+    timeout: int = 20,
     max_retries: int = 3,
-    retry_delay: float = 2.0
+    retry_delay: float = 2.0,
+    session: Optional[Any] = None,
+    proxy_url: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Resolves BuzzHeavier download link and direct CDN stream URL using curl_cffi.
-    Includes exponential backoff retry and TLS fingerprint rotation upon Cloudflare challenges.
+    Resolves the BuzzHeavier download link and direct CDN stream URL using curl_cffi.
+
+    Strategy:
+      - Reuse the caller's (warm) session on the first attempt.
+      - On failures, rotate to the next supported browser fingerprint on a FRESH
+        warmed session (clean cookies, clean TLS identity).
+      - Follow htmx responses (hx-get chains) until an HX-Redirect to the CDN is found.
     """
-    page_url = f"https://buzzheavier.com/{file_id}"
+    page_url = f"{BASE_URL}/{file_id}"
     result = {
         "file_id": file_id,
         "page_url": page_url,
@@ -87,61 +292,65 @@ def resolve_buzzheavier_link(
         "token_link": None,
         "token": None,
         "direct_cdn_url": None,
+        "fingerprint": None,
     }
 
-    # Browser TLS fingerprint candidates to rotate on retry
-    candidate_impersonates = [impersonate]
-    for alt in ["chrome146", "chrome145", "safari17_0", "safari172_ios", "safari180", "safari180_ios", "safari184", "safari184_ios", "safari260", "safari260_ios", "safari2601", "firefox144", "firefox147"]:
-        if alt not in candidate_impersonates:
-            candidate_impersonates.append(alt)
-
+    candidate_targets = build_candidate_targets(impersonate)
     last_error = None
 
     for attempt in range(max_retries + 1):
-        imp = candidate_impersonates[attempt % len(candidate_impersonates)]
+        target = candidate_targets[attempt % len(candidate_targets)]
+
         if attempt > 0:
-            wait_time = retry_delay * (2 ** (attempt - 1)) + random.uniform(0.3, 1.2)
-            print(f"    [*] Cloudflare challenge or transient issue detected. Retrying in {wait_time:.1f}s (attempt {attempt}/{max_retries}) using impersonate='{imp}'...")
+            kind = "rate_limited" if (last_error or "").startswith("rate_limited") else "challenge"
+            wait_time = backoff_seconds(attempt, retry_delay, kind)
+            print(f"    [*] Cloudflare challenge or transient issue detected. Retrying in {wait_time:.1f}s (attempt {attempt}/{max_retries}) using impersonate='{target}'...")
             time.sleep(wait_time)
 
-        session = requests.Session(impersonate=imp)
+        # Attempt 0 reuses the caller's warm session; later attempts start fresh
+        # with the rotated fingerprint so we get a new TLS identity and cookie jar.
+        if attempt == 0 and session is not None:
+            current_session = session
+        else:
+            current_session = make_session(target, proxy_url=proxy_url, timeout=timeout)
+            # Remember a successful session so it can become the new thread session
+            setattr(current_session, "_bh_target", target)
+        result["fingerprint"] = target
 
+        # ---------------------------------------------------------------
         # 1. Fetch the file landing page
+        # ---------------------------------------------------------------
         try:
-            r = session.get(page_url, timeout=timeout)
+            r = current_session.get(page_url, timeout=timeout)
         except Exception as e:
             last_error = f"Request error: {e}"
             continue
 
-        if r.status_code == 404:
+        page_class = classify_response(r)
+        if page_class == "not_found":
             raise RuntimeError(f"File not found (404). File ID '{file_id}' may be invalid or deleted.")
-
-        if is_cloudflare_challenge(r.status_code, r.text):
-            last_error = f"Cloudflare challenge encountered (HTTP {r.status_code})."
+        if page_class in ("challenge", "rate_limited", "transient"):
+            last_error = f"{'rate_limited' if page_class == 'rate_limited' else 'challenge'} on landing page (HTTP {r.status_code})"
             continue
-
         if r.status_code != 200:
             last_error = f"Unexpected HTTP {r.status_code} from landing page."
             continue
 
         html = r.text
 
-        # 2. Parse title and download button
+        # ---------------------------------------------------------------
+        # 2. Parse title and locate the htmx download endpoint
+        # ---------------------------------------------------------------
         if BeautifulSoup:
             soup = BeautifulSoup(html, "html.parser")
             if soup.title and soup.title.string:
                 t = soup.title.string.strip()
-                if t not in ("Buzzheavier", "Just a moment..."):
+                if t not in ("Buzzheavier", "Just a moment...", "buzzheavier.com"):
                     result["file_name"] = t
             btn = soup.find("a", attrs={"hx-get": re.compile(r"download")})
-            if btn:
-                hx_get = btn.get("hx-get")
-                btn_text = btn.get_text()
-            else:
-                hx_get = None
-                btn_text = ""
+            hx_get = btn.get("hx-get") if btn else None
+            btn_text = btn.get_text() if btn else ""
         else:
-            # Fallback regex parsing if bs4 is missing
             title_m = re.search(r'<title>([^<]+)</title>', html, re.IGNORECASE)
             if title_m:
                 result["file_name"] = title_m.group(1).strip()
@@ -154,119 +363,216 @@ def resolve_buzzheavier_link(
                 btn_text = ""
 
         if not hx_get:
-            if is_cloudflare_challenge(r.status_code, html):
-                last_error = "Cloudflare challenge encountered. Please retry or verify the link."
-                continue
-            last_error = "Could not find download link on page. File might be protected or removed."
+            page_class_retry = classify_response(r)
+            if page_class_retry in ("challenge", "rate_limited", "transient"):
+                last_error = f"{'rate_limited' if page_class_retry == 'rate_limited' else 'challenge'} on landing page (HTTP {r.status_code})"
+            else:
+                last_error = "Could not find download link on page. File might be protected or removed."
             continue
 
-        # Size extraction from button text
         size_m = re.search(r'([0-9.]+\s*(?:B|KB|MB|GB|TB))', btn_text, re.IGNORECASE)
         if size_m:
             result["file_size"] = size_m.group(1).strip()
 
-        # Build tokenized link
-        token_link = f"https://buzzheavier.com{hx_get}" if hx_get.startswith("/") else hx_get
+        token_link = f"{BASE_URL}{hx_get}" if hx_get.startswith("/") else hx_get
         result["token_link"] = token_link
-
         token_m = re.search(r'[?&]t=([^&]+)', hx_get)
         if token_m:
             result["token"] = token_m.group(1)
 
-        # 3. Simulate HTMX request to fetch direct CDN link from HX-Redirect
-        htmx_headers = {
-            "HX-Request": "true",
-            "Referer": page_url,
-            "HX-Current-URL": page_url,
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-origin",
-        }
+        # ---------------------------------------------------------------
+        # 3. Simulate the htmx click; follow hx-get chains until HX-Redirect
+        # ---------------------------------------------------------------
+        htmx_headers = dict(XHR_HEADERS)
+        htmx_headers["Referer"] = page_url
+        htmx_headers["HX-Current-URL"] = page_url
 
-        try:
-            r_htmx = session.get(token_link, headers=htmx_headers, allow_redirects=False, timeout=timeout)
-        except Exception as e:
-            last_error = f"HTMX redirect request error: {e}"
-            continue
+        current_url = token_link
+        direct_cdn = None
+        htmx_failed_class = None
 
-        if is_cloudflare_challenge(r_htmx.status_code, r_htmx.text):
-            last_error = f"Cloudflare challenge encountered during token redirect (HTTP {r_htmx.status_code})."
-            continue
+        for hop in range(4):
+            try:
+                r_htmx = current_session.get(current_url, headers=htmx_headers, allow_redirects=False, timeout=timeout)
+            except Exception as e:
+                htmx_failed_class = "transient"
+                last_error = f"HTMX redirect request error: {e}"
+                break
 
-        direct_cdn = r_htmx.headers.get("hx-redirect") or r_htmx.headers.get("location")
+            htmx_class = classify_response(r_htmx)
+            if htmx_class in ("challenge", "rate_limited", "transient"):
+                htmx_failed_class = htmx_class
+                last_error = f"{'rate_limited' if htmx_class == 'rate_limited' else 'challenge'} during token redirect (HTTP {r_htmx.status_code})"
+                break
+            if htmx_class == "not_found":
+                htmx_failed_class = "not_found"
+                last_error = f"Download endpoint returned HTTP {r_htmx.status_code} (token may have expired)."
+                break
+
+            # A redirect to the CDN endpoint is the final answer
+            hx_redirect = r_htmx.headers.get("hx-redirect")
+            location = r_htmx.headers.get("location")
+
+            for candidate_url in (hx_redirect, location):
+                if candidate_url and _looks_like_cdn(candidate_url):
+                    direct_cdn = candidate_url
+                    break
+
+            if direct_cdn:
+                break
+
+            # A same-origin redirect / nested hx-get means we must click again
+            next_url = None
+            if r_htmx.status_code in (301, 302, 303, 307, 308) and location:
+                next_url = location if location.startswith("http") else f"{BASE_URL}{location}"
+            elif hx_redirect and hx_redirect.startswith("/"):
+                next_url = f"{BASE_URL}{hx_redirect}"
+
+            if not next_url:
+                frag_m = re.search(r'hx-get=["\']([^"\']+download[^"\']*)["\']', r_htmx.text or "", re.IGNORECASE)
+                if frag_m:
+                    next_url = frag_m.group(1) if frag_m.group(1).startswith("http") else f"{BASE_URL}{frag_m.group(1)}"
+
+            if next_url and next_url != current_url:
+                current_url = next_url
+                continue
+
+            htmx_failed_class = "other"
+            last_error = "HTMX response contained no direct CDN redirect."
+            break
+
         if direct_cdn:
             result["direct_cdn_url"] = direct_cdn
+            # Verify file name from Content-Disposition if not found yet
+            if not result["file_name"]:
+                try:
+                    head_resp = current_session.head(direct_cdn, timeout=timeout)
+                    cd = head_resp.headers.get("content-disposition", "")
+                    cd_m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', cd)
+                    if cd_m:
+                        result["file_name"] = cd_m.group(1).strip()
+                except Exception:
+                    pass
+            # Persist the winning session for reuse by the next link in this thread
+            if hasattr(current_session, "_bh_target"):
+                _thread_ctx.session = current_session
+            return result
 
-        # Also verify file name from Content-Disposition if not found yet
-        if direct_cdn and not result["file_name"]:
-            try:
-                head_resp = session.head(direct_cdn, timeout=timeout)
-                cd = head_resp.headers.get("content-disposition", "")
-                cd_m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', cd)
-                if cd_m:
-                    result["file_name"] = cd_m.group(1).strip()
-            except Exception:
-                pass
-
-        return result
+        if htmx_failed_class == "not_found":
+            # Token may have expired; retrying the whole flow regenerates it
+            last_error = "Download endpoint returned 404 (token may have expired)."
+            continue
+        if htmx_failed_class is None:
+            last_error = last_error or "Could not obtain direct CDN URL."
+        continue
 
     raise RuntimeError(last_error or "Cloudflare challenge encountered. Please retry or verify the link.")
 
 
-def download_first_byte(url: str, impersonate: str = "chrome124", max_retries: int = 2, retry_delay: float = 1.5) -> bytes:
+def download_first_byte(url: str, impersonate: str = "chrome", max_retries: int = 2,
+                        retry_delay: float = 1.5, session: Optional[Any] = None,
+                        proxy_url: Optional[str] = None) -> bytes:
     """Downloads and returns the first 1 byte from the direct CDN URL with retry."""
     for attempt in range(max_retries + 1):
         if attempt > 0:
-            wait_time = retry_delay * attempt + random.uniform(0.2, 0.5)
-            time.sleep(wait_time)
+            time.sleep(retry_delay * attempt + random.uniform(0.2, 0.5))
+        current = session if (attempt == 0 and session is not None) else make_session(
+            impersonate, proxy_url=proxy_url, warm_up=(attempt > 0))
         try:
-            session = requests.Session(impersonate=impersonate)
-            # BuzzHeavier supports HTTP Range requests (HTTP 206 Partial Content)
-            resp = session.get(url, headers={"Range": "bytes=0-0"}, timeout=15)
-            if resp.status_code in (200, 206) and resp.content:
-                return resp.content[:1]
+            # stream=True + explicit close: if the server ignores the Range header
+            # and answers 200 with the full body, we avoid downloading it all.
+            resp = current.get(url, headers={"Range": "bytes=0-0"}, stream=True, timeout=15)
+            cls = classify_response(resp)
+            if cls == "ok" and resp.status_code in (200, 206):
+                for chunk in resp.iter_content(chunk_size=8):
+                    if chunk:
+                        return chunk[:1]
+                    break
+                resp.close()
+                if resp.status_code == 206:
+                    return b""  # empty 206 body: nothing to inspect
+                continue
+            if cls == "not_found":
+                resp.close()
+                return b""
+            resp.close()
 
             # Fallback: stream and grab the first byte
-            r = session.get(url, stream=True, timeout=15)
+            r = current.get(url, stream=True, timeout=15)
             r.raise_for_status()
             for chunk in r.iter_content(chunk_size=1):
                 if chunk:
+                    r.close()
                     return chunk[:1]
+            r.close()
         except Exception:
             continue
     return b""
 
 
-def download_last_byte(url: str, impersonate: str = "chrome124", max_retries: int = 2, retry_delay: float = 1.5) -> bytes:
+def download_last_byte(url: str, impersonate: str = "chrome", max_retries: int = 2,
+                       retry_delay: float = 1.5, session: Optional[Any] = None,
+                       proxy_url: Optional[str] = None) -> bytes:
     """Downloads and returns the last 1 byte from the direct CDN URL with retry."""
     for attempt in range(max_retries + 1):
         if attempt > 0:
-            wait_time = retry_delay * attempt + random.uniform(0.2, 0.5)
-            time.sleep(wait_time)
+            time.sleep(retry_delay * attempt + random.uniform(0.2, 0.5))
+        current = session if (attempt == 0 and session is not None) else make_session(
+            impersonate, proxy_url=proxy_url, warm_up=(attempt > 0))
         try:
-            session = requests.Session(impersonate=impersonate)
-            # HTTP Range suffix request: bytes=-1 requests the last 1 byte
-            resp = session.get(url, headers={"Range": "bytes=-1"}, timeout=15)
-            if resp.status_code in (200, 206) and resp.content:
-                return resp.content[-1:]
+            # HTTP Range suffix request: bytes=-1 requests the last 1 byte.
+            # stream=True + explicit close protects against servers that ignore
+            # the Range header and return the full body.
+            resp = current.get(url, headers={"Range": "bytes=-1"}, stream=True, timeout=15)
+            cls = classify_response(resp)
+            if cls == "ok" and resp.status_code in (200, 206):
+                content = bytearray()
+                for chunk in resp.iter_content(chunk_size=65536):
+                    if chunk:
+                        content.extend(chunk)
+                        if len(content) > 1:
+                            break  # got enough bytes; abort the transfer
+                resp.close()
+                if resp.status_code == 206:
+                    return bytes(content[-1:]) if content else b""
+                if content:
+                    # Server ignored Range (200, full body): we only buffered the
+                    # first chunk, which is NOT the last byte -> try exact offset.
+                    pass
+                else:
+                    continue
+            elif cls == "not_found":
+                resp.close()
+                return b""
+            else:
+                resp.close()
 
             # Fallback: query Content-Length and request exact last byte offset
-            head = session.head(url, timeout=15)
+            head = current.head(url, timeout=15)
             total_size = int(head.headers.get("content-length", 0))
             if total_size > 0:
-                resp = session.get(url, headers={"Range": f"bytes={total_size - 1}-{total_size - 1}"}, timeout=15)
-                if resp.status_code in (200, 206) and resp.content:
-                    return resp.content[-1:]
+                resp = current.get(url, headers={"Range": f"bytes={total_size - 1}-{total_size - 1}"}, stream=True, timeout=15)
+                if resp.status_code in (200, 206):
+                    data = b""
+                    for chunk in resp.iter_content(chunk_size=8):
+                        if chunk:
+                            data = chunk
+                            break
+                    resp.close()
+                    if data:
+                        return data[-1:]
+                resp.close()
         except Exception:
             continue
     return b""
 
 
-def download_file(url: str, output_path: Optional[str] = None, impersonate: str = "chrome124"):
+def download_file(url: str, output_path: Optional[str] = None, impersonate: str = "chrome",
+                  proxy_url: Optional[str] = None, session: Optional[Any] = None):
     """Downloads the file from the direct CDN URL with progress display."""
-    session = requests.Session(impersonate=impersonate)
+    current = session or make_session(impersonate, proxy_url=proxy_url, warm_up=False)
     print("[*] Starting download from CDN...")
-    r = session.get(url, stream=True)
+    r = current.get(url, stream=True)
     r.raise_for_status()
     if not output_path:
         cd = r.headers.get("content-disposition", "")
@@ -315,11 +621,14 @@ def parse_shard_spec(spec: Optional[str]) -> Tuple[int, int]:
     return shard_idx, total_shards
 
 
-def process_single_item(idx: int, total: int, line: str, args, log_lock: Optional[threading.Lock] = None) -> Dict[str, Any]:
+def process_single_item(idx: int, total: int, line: str, args, log_lock: Optional[threading.Lock] = None,
+                        fresh_session: bool = False) -> Dict[str, Any]:
     """Processes a single link/ID with full resolution, byte pings, and downloads."""
     file_id = parse_file_id(line)
     retries = getattr(args, "retries", 10)
     retry_delay = getattr(args, "retry_delay", 2.0)
+    proxy_url = getattr(args, "resolved_proxy", None)
+    timeout = getattr(args, "timeout", 20)
 
     def log(msg: str):
         if log_lock:
@@ -328,11 +637,19 @@ def process_single_item(idx: int, total: int, line: str, args, log_lock: Optiona
         else:
             print(msg)
 
+    if fresh_session:
+        session = reset_thread_session(args.impersonate, proxy_url, timeout=timeout)
+    else:
+        session = get_thread_session(args.impersonate, proxy_url, timeout=timeout)
+
     data = resolve_buzzheavier_link(
         file_id,
         impersonate=args.impersonate,
+        timeout=timeout,
         max_retries=retries,
-        retry_delay=retry_delay
+        retry_delay=retry_delay,
+        session=session,
+        proxy_url=proxy_url,
     )
     file_name = data.get('file_name') or line
     file_size = data.get('file_size') or "N/A"
@@ -344,7 +661,9 @@ def process_single_item(idx: int, total: int, line: str, args, log_lock: Optiona
             data["direct_cdn_url"],
             impersonate=args.impersonate,
             max_retries=retries,
-            retry_delay=retry_delay
+            retry_delay=retry_delay,
+            session=session,
+            proxy_url=proxy_url,
         )
         if b:
             val = b[0]
@@ -359,7 +678,9 @@ def process_single_item(idx: int, total: int, line: str, args, log_lock: Optiona
             data["direct_cdn_url"],
             impersonate=args.impersonate,
             max_retries=retries,
-            retry_delay=retry_delay
+            retry_delay=retry_delay,
+            session=session,
+            proxy_url=proxy_url,
         )
         if b:
             val = b[0]
@@ -368,7 +689,8 @@ def process_single_item(idx: int, total: int, line: str, args, log_lock: Optiona
             log(f"    First Byte: {b} (Hex: 0x{val:02x}, Repr: {char_repr}) -> SUCCESS")
 
     if args.download:
-        download_file(data["direct_cdn_url"], output_path=args.output, impersonate=args.impersonate)
+        download_file(data["direct_cdn_url"], output_path=args.output, impersonate=args.impersonate,
+                      proxy_url=proxy_url, session=session)
 
     return {
         "idx": idx,
@@ -433,6 +755,9 @@ def process_batch(file_path: str, args):
     else:
         print(f"  BATCH PROCESSING: {len(shard_items)} LINK(S)")
     print(f"  Pacing: {pace_delay}s delay | Workers: {workers} | Retries: {retries} | Retry Backoff: {retry_delay}s")
+    print(f"  Fingerprint: {args.impersonate} (rotation list: {', '.join(build_candidate_targets(args.impersonate))})")
+    if getattr(args, "resolved_proxy", None):
+        print(f"  Proxy: configured ({len(args.resolved_proxy)} chars, value hidden)")
     print("=" * 60)
 
     results: Dict[int, Dict[str, Any]] = {}
@@ -503,11 +828,11 @@ def process_batch(file_path: str, args):
                 }
                 failed_items.append((orig_idx, line))
 
-    # Pass 2: Automatic retry pass for failed links
+    # Pass 2: Automatic retry pass for failed links (fresh session identity)
     no_retry_pass = getattr(args, "no_retry_pass", False)
     if failed_items and not no_retry_pass:
         print("\n" + "=" * 60)
-        print(f"  RETRY PASS: Re-attempting {len(failed_items)} failed link(s) after 5s cool-down...")
+        print(f"  RETRY PASS: Re-attempting {len(failed_items)} failed link(s) after 5s cool-down (fresh session)...")
         print("=" * 60)
         time.sleep(5.0)
 
@@ -520,7 +845,7 @@ def process_batch(file_path: str, args):
 
             print(f"\n[Retry Pass: Link #{orig_idx}] Target: {line}")
             try:
-                res = process_single_item(orig_idx, len(unique_lines), line, args)
+                res = process_single_item(orig_idx, len(unique_lines), line, args, fresh_session=True)
                 results[orig_idx] = res
                 recovered_count += 1
                 print("    -> [RECOVERED] Successfully resolved on retry pass!")
@@ -662,8 +987,8 @@ def main():
     )
     parser.add_argument(
         "--impersonate",
-        default="chrome124",
-        help="Browser TLS fingerprint to impersonate (default: chrome124)"
+        default="chrome",
+        help="Browser TLS fingerprint to impersonate (default: 'chrome' = newest profile; rotated automatically on retries)"
     )
     parser.add_argument(
         "--retries",
@@ -682,6 +1007,17 @@ def main():
         type=float,
         default=1.0,
         help="Delay in seconds between successive links in batch mode to prevent rate limiting (default: 1.0)"
+    )
+    parser.add_argument(
+        "--proxy",
+        default=None,
+        help="HTTP/SOCKS proxy URL for all requests (also via env BH_PROXY). Recommended on datacenter IPs like GitHub Actions."
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=20,
+        help="Request timeout in seconds (default: 20)"
     )
     parser.add_argument(
         "--no-retry-pass",
@@ -720,6 +1056,9 @@ def main():
 
     args = parser.parse_args()
 
+    # Resolve proxy: CLI flag overrides environment variable
+    args.resolved_proxy = args.proxy or get_proxy_from_env()
+
     # Check if batch mode via --file or positional file path
     batch_file = args.file
     if not batch_file and args.input and os.path.isfile(args.input):
@@ -747,12 +1086,17 @@ def main():
         print(f"[*] Target File ID: {file_id}")
         print(f"[*] Resolving via curl-cffi (impersonating {args.impersonate})...")
 
+    session = get_thread_session(args.impersonate, args.resolved_proxy, timeout=args.timeout)
+
     try:
         data = resolve_buzzheavier_link(
             file_id,
             impersonate=args.impersonate,
+            timeout=args.timeout,
             max_retries=args.retries,
-            retry_delay=args.retry_delay
+            retry_delay=args.retry_delay,
+            session=session,
+            proxy_url=args.resolved_proxy,
         )
     except Exception as e:
         if args.json:
@@ -768,7 +1112,9 @@ def main():
             data["direct_cdn_url"],
             impersonate=args.impersonate,
             max_retries=args.retries,
-            retry_delay=args.retry_delay
+            retry_delay=args.retry_delay,
+            session=session,
+            proxy_url=args.resolved_proxy,
         )
         if b:
             val = b[0]
@@ -789,7 +1135,9 @@ def main():
             data["direct_cdn_url"],
             impersonate=args.impersonate,
             max_retries=args.retries,
-            retry_delay=args.retry_delay
+            retry_delay=args.retry_delay,
+            session=session,
+            proxy_url=args.resolved_proxy,
         )
         if b:
             val = b[0]
@@ -847,7 +1195,8 @@ def main():
         print("=" * 55)
 
     if args.download and data["direct_cdn_url"]:
-        download_file(data["direct_cdn_url"], output_path=args.output, impersonate=args.impersonate)
+        download_file(data["direct_cdn_url"], output_path=args.output, impersonate=args.impersonate,
+                      proxy_url=args.resolved_proxy, session=session)
 
 
 if __name__ == "__main__":

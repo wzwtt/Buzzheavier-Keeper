@@ -6,8 +6,10 @@ A fast, lightweight Python tool and automated GitHub Action to resolve direct do
 
 ## ⚡ Features
 
-- **🚀 Ultra-Fast Resolution:** Uses `curl-cffi` with browser TLS fingerprint impersonation (`chrome124` / `chrome131`) to bypass Cloudflare protection in ~1 second without running heavy headless browsers.
-- **🔄 Resilient Retry & Anti-Blocking Logic:** Built-in exponential backoff, jitter, and browser fingerprint rotation (`chrome124`, `chrome131`, `safari17_0`, `safari18_0`, `chrome120`) to effortlessly overcome transient Cloudflare challenges.
+- **🚀 Ultra-Fast Resolution:** Uses `curl-cffi` with browser TLS fingerprint impersonation (always the newest `chrome` profile, e.g. Chrome 152) to bypass Cloudflare protection in ~1 second without running heavy headless browsers.
+- **🔄 Resilient Retry & Anti-Blocking Logic:** Detects Cloudflare challenges via status codes, HTML markers **and the `cf-mitigated: challenge` response header**, then retries with exponential backoff + jitter (doubled cool-down on HTTP 429). Each retry switches to a **fresh warmed session** with a **different, validated browser fingerprint** (`chrome` → `chrome152` → `chrome151` → `chrome146` → … targets are checked against the installed `curl_cffi` version at runtime, so no more crashes on unsupported fingerprints).
+- **🔥 Session Warm-Up & Reuse:** Worker threads keep a long-lived, cookie-carrying session (including Cloudflare's `__cf_bm` bot-management cookie) and hit the homepage first, so file-page requests never look like cold, cookieless bot visits. Failed items are retried in a second pass with a completely fresh session identity.
+- **🧦 Optional Proxy Support:** Route all requests through an HTTP/SOCKS proxy (`--proxy` flag or `BH_PROXY` env / `PROXY_URL` secret). Strongly recommended when running from datacenter IPs (e.g. GitHub Actions runners), which Cloudflare scores badly.
 - **⏱️ Smart Batch Pacing & Recovery Pass:** Introduces configurable pacing delay between links (default `1.0s`) to prevent triggering rate limits on large batches (100+ links), plus an automatic secondary retry pass for any links that experienced temporary hiccups.
 - **🛡️ Bandwidth-Friendly Keep-Alive:** Uses HTTP Range requests (`Range: bytes=-1`) to download only the **last 1 byte** of large files (e.g. 15GB+ files) to ping the CDN and keep links alive with virtually zero bandwidth usage.
 - **🔗 Dual Link Extraction:**
@@ -74,6 +76,8 @@ python get_download_link.py links.txt -l
 | Flag | Default | Description |
 |---|---|---|
 | `--delay <seconds>` | `1.0` | Pacing delay between batch links to prevent Cloudflare rate limits |
+| `--proxy <url>` | env `BH_PROXY` | HTTP/SOCKS proxy URL used for all requests (e.g. `http://user:pass@host:port` or `socks5://host:port`) |
+| `--timeout <seconds>` | `20` | Request timeout per HTTP call |
 | `--shard <X/Y>` | `1/1` | Run shard `X` out of `Y` total shards (e.g. `1/5` for runner 1 of 5) |
 | `--workers <count>` | `1` | Number of concurrent worker threads within each runner |
 | `--retries <count>` | `3` | Max retries per link upon Cloudflare challenges or network hiccups |
@@ -106,9 +110,18 @@ The repository includes a distributed GitHub Actions workflow in [`.github/workf
 ### 🚀 Architecture Highlights:
 - **⚡ Parallel Matrix Sharding (5x–10x Speedup):** Automatically partitions `links.txt` across **5 parallel runner jobs** (configurable from 1 to 10 via manual trigger).
 - **🌐 Distributed Multi-IP Requests:** Each GitHub Action runner executes on an independent VM with a distinct public IP address, eliminating Cloudflare rate limits and IP blocking.
-- **🧹 Automatic Link Deduplication:** Deduplicates redundant entries from `links.txt` before sharding to avoid duplicate requests.
+- **🎲 Randomized Start Jitter:** Each shard sleeps a random 0–90s before starting so the runner fleet doesn't hit Cloudflare as a synchronized burst from adjacent Azure IP ranges.
+- **🧵 Non-Overlapping Runs:** A concurrency group prevents schedule/push/manual runs from stacking up.
 - **🛡️ Soft-Fail & Dead Link Isolation:** Dead/expired links (HTTP 404) are isolated into a downloadable `dead-links-report` workflow artifact instead of crashing the entire keep-alive workflow.
 - **📊 Consolidated Step Summary:** A final reporting job aggregates all shard outputs and publishes an overview dashboard with success rates, failed link tables, and collapsible sections.
+
+### 🧦 Beating Cloudflare on GitHub-Hosted Runners (optional but recommended)
+
+GitHub runner IPs belong to a few well-known Azure datacenter ranges that Cloudflare scores poorly, so challenges can still appear even with perfect TLS fingerprints. The workflow already rotates fingerprints, re-warms sessions, staggers starts and retries aggressively — but if your success rate is still below ~95%, add a proxy:
+
+1. Get any residential/ISP HTTP or SOCKS5 proxy (a single cheap static one is enough — traffic is only a few KB per link per run).
+2. In your repository, go to **Settings → Secrets and variables → Actions → New repository secret**, name it `PROXY_URL`, and set the value to e.g. `http://user:pass@proxy.example.com:8080`.
+3. That's it — every shard automatically sends all requests through it (`BH_PROXY` env). Without the secret, everything falls back to the multi-fingerprint retry logic.
 
 ### How It Works:
 1. Add your file links to `links.txt` (one link per line):
@@ -148,3 +161,5 @@ The repository includes a distributed GitHub Actions workflow in [`.github/workf
 ## 📄 License
 
 This project is licensed under the [MIT License](LICENSE).
+
+> AI生成

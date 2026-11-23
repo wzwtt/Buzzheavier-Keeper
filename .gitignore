@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
+.temp/
 reports/
 all_reports/
 dead_links.txt
