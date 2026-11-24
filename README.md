@@ -81,7 +81,7 @@ python get_download_link.py links.txt -l
 | `--timeout <seconds>` | `20` | Request timeout per HTTP call |
 | `--no-browser-fallback` | off | Disable the stealth browser fallback (curl_cffi fast path only) |
 | `--browser-only` | off | Resolve directly via the stealth browser (skips the curl_cffi fast path) |
-| `--browser-timeout <seconds>` | `90` | Overall timeout for one stealth-browser fallback attempt |
+| `--browser-timeout <seconds>` | `120` | Overall timeout for one stealth-browser fallback attempt |
 | `--shard <X/Y>` | `1/1` | Run shard `X` out of `Y` total shards (e.g. `1/5` for runner 1 of 5) |
 | `--workers <count>` | `1` | Number of concurrent worker threads within each runner |
 | `--retries <count>` | `3` | Max retries per link upon Cloudflare challenges or network hiccups |

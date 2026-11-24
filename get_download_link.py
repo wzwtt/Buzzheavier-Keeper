@@ -223,10 +223,24 @@ def proxies_dict(proxy_url: Optional[str]) -> Optional[Dict[str, str]]:
     return {"http": proxy_url, "https": proxy_url}
 
 
-def make_session(impersonate: str, proxy_url: Optional[str] = None, warm_up: bool = True, timeout: int = 20):
+def make_session(impersonate: str, proxy_url: Optional[str] = None, warm_up: bool = True, timeout: int = 20,
+                 cookies: Optional[List[Dict[str, Any]]] = None, user_agent: Optional[str] = None):
     """Creates an impersonated session, optionally 'warming it up' on the homepage so
-    that Cloudflare bot-management cookies (__cf_bm) are already in the jar."""
+    that Cloudflare bot-management cookies (__cf_bm) are already in the jar.
+    `cookies`/`user_agent` (typically harvested from the stealth browser fallback)
+    seed the jar with the solved cf_clearance cookie and keep the UA consistent,
+    which Cloudflare's clearance validation requires."""
     session = requests.Session(impersonate=impersonate, proxies=proxies_dict(proxy_url))
+    if user_agent:
+        session.headers.update({"User-Agent": user_agent})
+    if cookies:
+        for c in cookies:
+            try:
+                domain = (c.get("domain") or "buzzheavier.com").lstrip(".")
+                session.cookies.set(c["name"], c["value"], domain=domain,
+                                    path=c.get("path") or "/", secure=bool(c.get("secure")))
+            except Exception:
+                pass
     if warm_up:
         try:
             session.get(WARMUP_URL, timeout=timeout)
@@ -318,6 +332,9 @@ class BrowserSession:
         # them on the curl fast path without re-launching the browser.
         self.last_cookies: Optional[List[Dict[str, Any]]] = None
         self.last_user_agent: Optional[str] = None
+        # Channel rotation state (chrome <-> msedge on relaunch)
+        self._channel_idx = 0
+        self._relaunched_for_challenge = False
 
     @classmethod
     def get(cls) -> "BrowserSession":
@@ -371,7 +388,8 @@ class BrowserSession:
             raise RuntimeError(f"Browser launch previously failed: {self._launch_error}")
         pw = _sync_playwright().start()
         last_err = None
-        for channel in BROWSER_CHANNELS:
+        ordered = list(BROWSER_CHANNELS[self._channel_idx:]) + list(BROWSER_CHANNELS[:self._channel_idx])
+        for channel in ordered:
             try:
                 kwargs: Dict[str, Any] = {
                     "user_data_dir": os.path.abspath(BROWSER_PROFILE_DIR),
@@ -401,42 +419,80 @@ class BrowserSession:
                 pass
         self._context, self._playwright = None, None
 
+    def restart(self):
+        """Must run ON the browser thread: closes the context and rotates to the next
+        browser channel, so the next _ensure_context relaunches with a fresh identity."""
+        self._close_all()
+        self._launch_error = None
+        self._channel_idx = (self._channel_idx + 1) % len(BROWSER_CHANNELS)
+
     # ---- challenge helpers ------------------------------------------------
 
     @staticmethod
     def _try_click_turnstile(page) -> bool:
-        """Best-effort click on the Turnstile checkbox for interactive challenges."""
+        """Best-effort click on the Turnstile checkbox for interactive challenges.
+        Cloudflare renders the widget inside nested cross-origin iframes, so every
+        frame in the page is scanned (Playwright's frame list is recursive)."""
         try:
             for frame in page.frames:
-                if "challenges.cloudflare.com" in (frame.url or ""):
-                    boxes = frame.locator("input[type=checkbox]")
-                    if boxes.count() > 0:
-                        boxes.first.click(timeout=3000)
-                        return True
+                fu = frame.url or ""
+                if "challenges.cloudflare.com" not in fu:
+                    continue
+                for sel in ("input[type=checkbox]", "label", "[id^='turnstile']"):
+                    try:
+                        loc = frame.locator(sel)
+                        if loc.count() > 0:
+                            loc.first.click(timeout=2000)
+                            return True
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        # Fallback: click the widget container on the host page (its centre is
+        # roughly where the checkbox renders).
+        try:
+            for sel in (".cf-turnstile", "iframe[src*='challenges.cloudflare.com']"):
+                loc = page.locator(sel)
+                if loc.count() > 0:
+                    loc.first.click(timeout=2000)
+                    return True
         except Exception:
             pass
         return False
 
+    def _page_is_challenged(self, page) -> Optional[str]:
+        """Returns the challenge-ish page title, or None if the page looks clean."""
+        try:
+            title = (page.title() or "")
+        except Exception:
+            return "just a moment"
+        if any(m in title.lower() for m in CHALLENGE_TITLE_MARKERS):
+            return title
+        try:
+            content = page.content().lower()
+        except Exception:
+            content = ""
+        if any(m in content for m in CF_MARKERS + ("请稍候", "正在验证")):
+            return title or "just a moment"
+        return None
+
     def _wait_challenge_clear(self, page, timeout: float = 45.0) -> bool:
-        """Waits until the interstitial goes away (managed challenges auto-clear)."""
+        """Waits until the interstitial goes away. Managed challenges auto-solve;
+        interactive ones need the Turnstile checkbox clicked — the widget can render
+        seconds AFTER the page load, so the click is retried periodically instead of
+        being attempted exactly once at t=0."""
         deadline = time.time() + timeout
-        clicked = False
-        content_markers = CF_MARKERS + ("请稍候", "正在验证")
+        next_click_at = time.time() + 1.0   # give the widget a moment to render first
+        clicks = 0
         while time.time() < deadline:
-            try:
-                title = (page.title() or "").lower()
-            except Exception:
-                title = "just a moment"
-            if not any(m in title for m in CHALLENGE_TITLE_MARKERS):
-                try:
-                    content = page.content().lower()
-                except Exception:
-                    content = ""
-                if not any(m in content for m in content_markers):
-                    return True
-            if not clicked:
-                self._try_click_turnstile(page)
-                clicked = True
+            if self._page_is_challenged(page) is None:
+                return True
+            if time.time() >= next_click_at and clicks < 12:
+                if self._try_click_turnstile(page):
+                    clicks += 1
+                    next_click_at = time.time() + 2.5  # let the widget verify
+                else:
+                    next_click_at = time.time() + 1.5
             time.sleep(0.7)
         return False
 
@@ -462,30 +518,99 @@ def _browser_resolve_job(bs: "BrowserSession", file_id: str, timeout_s: float) -
     """Runs ON the browser thread: opens the file page, waits out any Cloudflare
     challenge, and resolves the token + CDN URL with an in-page fetch (so the request
     carries the real browser fingerprint and cookies; the Node-side HTTP client is
-    NOT good enough — verified experimentally, it gets 403'd). Returns (result, cookies, UA)."""
-    ctx = bs._ensure_context()
-    page = ctx.new_page()
-    try:
-        page_url = f"{BASE_URL}/{file_id}"
-        page.goto(page_url, timeout=max(5000, int((timeout_s - 10) * 1000)))
+    NOT good enough — verified experimentally, it gets 403'd). Returns (result, cookies, UA).
 
-        # The challenge may auto-solve right AFTER the load event fires, so instead
-        # of a single check we poll until the htmx download button actually appears
-        # (re-waiting the challenge if it flares up again in between).
-        html = ""
-        hx_m = None
-        btn_re = re.compile(r'<a[^>]*hx-get=["\']([^"\']*download[^"\']*)["\'][^>]*>(.*?)</a>', re.DOTALL | re.IGNORECASE)
-        deadline = time.time() + max(15.0, timeout_s - 10.0)
-        while time.time() < deadline:
-            if not bs._wait_challenge_clear(page, timeout=max(5.0, timeout_s - 10.0)):
-                raise RuntimeError("Cloudflare challenge did not auto-clear in the stealth browser.")
-            html = page.content()
-            hx_m = btn_re.search(html)
-            if hx_m:
+    Robustness: up to two navigation attempts (fresh page each time); after a cleared
+    challenge, one reload if the htmx button has not appeared yet; waiting is sliced so
+    the overall budget stays below the caller's submit() timeout (exceeding it would
+    poison the whole browser session for the process)."""
+    ctx = bs._ensure_context()
+    page_url = f"{BASE_URL}/{file_id}"
+    btn_re = re.compile(r'<a[^>]*hx-get=["\']([^"\']*download[^"\']*)["\'][^>]*>(.*?)</a>', re.DOTALL | re.IGNORECASE)
+
+    html = ""
+    hx_m = None
+    last_title = ""
+    nav_deadline = time.time() + max(20.0, timeout_s - 10.0)
+    page = None
+    won = False
+
+    try:
+        for nav in range(2):
+            page = ctx.new_page()
+            nav_status = None
+            try:
+                resp = page.goto(page_url, timeout=max(5000, int((timeout_s - 10) * 1000)))
+                nav_status = resp.status if resp else None
+            except Exception:
+                # Navigation failure: discard this page (fresh page on the next attempt)
+                try:
+                    page.close()
+                except Exception:
+                    pass
+                page = None
+                continue
+
+            reloaded = False
+            cleared_since = None
+            while time.time() < nav_deadline:
+                remaining = nav_deadline - time.time()
+                if not bs._wait_challenge_clear(page, timeout=min(10.0, max(2.0, remaining))):
+                    last_title = bs._page_is_challenged(page) or (page.title() or "")
+                    continue  # keep waiting in slices until the overall deadline
+                if cleared_since is None:
+                    cleared_since = time.time()
+                # A dead link stays dead: bail immediately instead of polling a 404
+                # page (which can never grow a download button) until the deadline.
+                if nav_status in (404, 410):
+                    raise RuntimeError(
+                        f"File not found (HTTP {nav_status}). File ID '{file_id}' may be invalid or deleted."
+                    )
+                try:
+                    html = page.content()
+                except Exception:
+                    html = ""
+                hx_m = btn_re.search(html)
+                if hx_m:
+                    won = True
+                    break
+                # Dead-document detection: after challenge clearance a 404 page has
+                # no download button and never will; the initial goto status was 403
+                # (the challenge itself), so recognise it by the page title instead.
+                try:
+                    page_title = (page.title() or "").strip().lower()
+                except Exception:
+                    page_title = ""
+                if page_title in ("404", "not found", "404 not found", "error 404", "file not found"):
+                    raise RuntimeError(
+                        f"File not found (404 page). File ID '{file_id}' may be invalid or deleted."
+                    )
+                # Challenge cleared but no button yet: one reload after a grace period
+                if not reloaded and time.time() - cleared_since > 4.0:
+                    reloaded = True
+                    try:
+                        page.reload(timeout=max(5000, int((timeout_s - 10) * 1000)))
+                    except Exception:
+                        pass
+                    continue
+                time.sleep(0.6)
+
+            if won:
                 break
-            time.sleep(0.6)
-        if not hx_m:
-            raise RuntimeError("Could not find download link on page (browser path).")
+            # this page lost: close it before trying a fresh navigation
+            try:
+                page.close()
+            except Exception:
+                pass
+            page = None
+            if nav == 0 and time.time() >= nav_deadline:
+                break
+
+        if not won or page is None:
+            raise RuntimeError(
+                "Cloudflare challenge did not auto-clear in the stealth browser "
+                f"(title={last_title[:60]!r}, channel={bs.channel})."
+            )
 
         cookies = ctx.cookies()
         ua = page.evaluate("navigator.userAgent")
@@ -551,10 +676,11 @@ def _browser_resolve_job(bs: "BrowserSession", file_id: str, timeout_s: float) -
                 result["file_name"] = cd_m.group(1).strip()
         return result, cookies, ua
     finally:
-        try:
-            page.close()
-        except Exception:
-            pass
+        if page is not None:
+            try:
+                page.close()
+            except Exception:
+                pass
 
 
 def try_cached_cookie_fast_path(file_id: str, args) -> Optional[Dict[str, Any]]:
@@ -582,14 +708,28 @@ def try_cached_cookie_fast_path(file_id: str, args) -> Optional[Dict[str, Any]]:
 
 def attempt_browser_fallback(file_id: str, args, want_last_byte: bool, want_first_byte: bool) -> Dict[str, Any]:
     """Resolves one link via the stealth browser and injects the harvested cookies into
-    the calling thread's curl_cffi session so later links run on the fast path again."""
+    the calling thread's curl_cffi session so later links run on the fast path again.
+
+    If the challenge does not clear with the current browser channel, the session is
+    restarted ONCE on the other channel (chrome <-> msedge) before giving up — the
+    second browser identity solves challenges the first one could not."""
     bs = BrowserSession.get()
-    timeout = float(getattr(args, "browser_timeout", 90))
+    timeout = float(getattr(args, "browser_timeout", 120))
 
     def job():
         return _browser_resolve_job(bs, file_id, timeout)
 
-    result, cookies, ua = bs.submit(job, timeout=timeout + 30)
+    try:
+        result, cookies, ua = bs.submit(job, timeout=timeout + 30)
+    except RuntimeError as e:
+        if "did not auto-clear" not in str(e) or bs._relaunched_for_challenge or len(BROWSER_CHANNELS) < 2:
+            raise
+        # Rotate to the other system browser and try once more with a fresh identity.
+        bs._relaunched_for_challenge = True
+        print(f"    [*] Challenge stuck on channel={bs.channel}; restarting the browser on the alternate channel...")
+        bs.submit(lambda: bs.restart(), timeout=30)
+        result, cookies, ua = bs.submit(job, timeout=timeout + 30)
+        bs._relaunched_for_challenge = False
 
     # Persist the challenge-solving cookies for the remainder of the batch
     # (other threads may reuse them via try_cached_cookie_fast_path too).
@@ -606,7 +746,7 @@ def browser_ping_byte(url: str, args, last: bool = True) -> bytes:
     homepage to solve a challenge (the Node-side HTTP client gets 403'd, so the
     ping itself must run through curl_cffi with the transferred cookies)."""
     bs = BrowserSession.get()
-    timeout = float(getattr(args, "browser_timeout", 90))
+    timeout = float(getattr(args, "browser_timeout", 120))
     proxy_url = getattr(args, "resolved_proxy", None)
 
     if not (bs.last_cookies and bs.last_user_agent):
@@ -1527,8 +1667,8 @@ def main():
     parser.add_argument(
         "--browser-timeout",
         type=int,
-        default=90,
-        help="Overall timeout in seconds for one stealth-browser fallback attempt (default: 90)"
+        default=120,
+        help="Overall timeout in seconds for one stealth-browser fallback attempt (default: 120)"
     )
 
     args = parser.parse_args()
