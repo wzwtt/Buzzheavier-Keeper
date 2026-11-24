@@ -63,7 +63,10 @@ jobs:
           MAX_SHARDS: ${{ inputs.max_shards || '50' }}
           LINKS_PER_SHARD: ${{ inputs.links_per_shard || '25' }}
         run: |
-          python - <<'PY' >> "$GITHUB_OUTPUT"
+          # NOTE: outputs are written straight to $GITHUB_OUTPUT from inside Python.
+          # Never redirect this script's whole stdout there: GitHub rejects any line
+          # that is not strictly `key=value` (e.g. human-readable log lines).
+          python - <<'PY'
           import json, math, os, re
 
           try:
@@ -95,9 +98,11 @@ jobs:
               # ceil(unique / per_shard), clamped to [1, max_shards]
               total = min(max_shards, max(1, (unique + per_shard - 1) // per_shard))
 
-          print(f"matrix={json.dumps(list(range(1, total + 1)))}")
-          print(f"total_shards={total}")
-          print(f"link_count={unique}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as gh_out:
+              gh_out.write(f"matrix={json.dumps(list(range(1, total + 1)))}\n")
+              gh_out.write(f"total_shards={total}\n")
+              gh_out.write(f"link_count={unique}\n")
+
           print(f"[plan] {unique} unique link(s) -> {total} runner(s) "
                 f"(target {per_shard} links/runner, cap {max_shards})")
           PY
