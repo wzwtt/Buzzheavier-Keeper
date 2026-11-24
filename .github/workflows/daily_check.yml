@@ -29,9 +29,9 @@ on:
         default: '1'
         type: string
       retries:
-        description: 'Max retries on transient Cloudflare challenges'
+        description: 'Max curl_cffi retries before stealth-browser fallback'
         required: false
-        default: '8'
+        default: '2'
         type: string
       soft_fail:
         description: 'Do not fail workflow if dead/expired (404) links are found'
@@ -112,15 +112,19 @@ jobs:
           SHARD_ARG="${{ matrix.shard }}/${{ needs.init-matrix.outputs.total_shards }}"
           DELAY_ARG="${{ inputs.delay || '1.0' }}"
           WORKERS_ARG="${{ inputs.workers || '1' }}"
-          RETRIES_ARG="${{ inputs.retries || '8' }}"
+          RETRIES_ARG="${{ inputs.retries || '2' }}"
           SOFT_FAIL_FLAG="${{ (inputs.soft_fail != false) && '--soft-fail' || '' }}"
 
-          python get_download_link.py links.txt -l \
+          # xvfb-run gives the stealth-browser fallback a virtual display: Cloudflare's
+          # managed challenges do not reliably auto-solve in headless Chromium (verified
+          # experimentally), so patchright runs headful under Xvfb on the runner.
+          xvfb-run -a python get_download_link.py links.txt -l \
             --shard "$SHARD_ARG" \
             --delay "$DELAY_ARG" \
             --workers "$WORKERS_ARG" \
             --retries "$RETRIES_ARG" \
             --retry-delay 2.0 \
+            --browser-timeout 90 \
             --output-json "reports/shard_${{ matrix.shard }}.json" \
             --failed-file "reports/failed_${{ matrix.shard }}.txt" \
             $SOFT_FAIL_FLAG

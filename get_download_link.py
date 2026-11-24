@@ -3,17 +3,18 @@
 BuzzHeavier Download Link Resolver (curl-cffi edition)
 Fast, lightweight link resolver and downloader for BuzzHeavier files using TLS fingerprint impersonation.
 
-Anti-Cloudflare design notes (v2):
-- Uses the *latest* browser fingerprint via aliases ("chrome") and rotates among
-  recently-pinned targets that are validated against the installed curl_cffi version.
-- Persists browser sessions (cookies incl. Cloudflare __cf_bm) across attempts and links
-  via a thread-local session pool, with a homepage "warm-up" so the first file-page hit
-  never looks like a cold, cookieless bot visit.
-- Detects Cloudflare challenges reliably: status codes, response HTML markers AND the
-  `cf-mitigated: challenge` response header.
-- Retries with exponential backoff + jitter; rate-limits (429) get doubled cool-downs.
-- Optional HTTP/SOCKS proxy support (--proxy / BH_PROXY env) — recommended when running
-  from datacenter IPs such as GitHub Actions runners, which Cloudflare scores poorly.
+Anti-Cloudflare design notes (v3 — two-tier):
+- Tier 1 (fast): curl_cffi with the *latest* browser fingerprint alias ("chrome"),
+  a runtime-validated fingerprint rotation list, thread-local warmed sessions and
+  classified challenge detection (status codes, HTML markers, cf-mitigated header).
+- Tier 2 (fallback): when Cloudflare persists after ~3 fingerprint rotations on a
+  datacenter IP, the link is resolved with a stealth browser (patchright — an
+  undetected Playwright fork — driving the system Chrome/Edge, no browser download
+  needed on GitHub runners). The browser auto-solves the managed challenge; its
+  cookies (cf_clearance/__cf_bm) are then injected back into the curl_cffi session so
+  the REST of the batch keeps running at curl speed.
+- Optional HTTP/SOCKS proxy support (--proxy / BH_PROXY env) as a second remedy for
+  datacenter IP scoring.
 """
 
 import sys
@@ -25,6 +26,8 @@ import io
 import time
 import random
 import threading
+import queue
+import atexit
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Any, Optional, List, Tuple
 
@@ -45,6 +48,17 @@ try:
     from bs4 import BeautifulSoup
 except ImportError:
     BeautifulSoup = None
+
+try:
+    from patchright.sync_api import sync_playwright as _sync_playwright
+    _BROWSER_LIB = "patchright"
+except ImportError:
+    try:
+        from playwright.sync_api import sync_playwright as _sync_playwright
+        _BROWSER_LIB = "playwright"
+    except ImportError:
+        _sync_playwright = None
+        _BROWSER_LIB = None
 
 
 BASE_URL = "https://buzzheavier.com"
@@ -230,10 +244,396 @@ def get_thread_session(primary_impersonate: str, proxy_url: Optional[str], timeo
     return session
 
 
-def reset_thread_session(primary_impersonate: str, proxy_url: Optional[str], timeout: int = 20):
-    """Discards the current thread session (e.g. after repeated challenges) and returns a fresh warmed one."""
-    _thread_ctx.session = make_session(primary_impersonate, proxy_url=proxy_url, timeout=timeout)
+def reset_thread_session(primary_impersonate: str, proxy_url: Optional[str], timeout: int = 20,
+                         cookies: Optional[List[Dict[str, Any]]] = None, user_agent: Optional[str] = None):
+    """Discards the current thread session (e.g. after repeated challenges) and returns a fresh
+    warmed one, optionally seeded with cookies harvested from the stealth browser fallback."""
+    _thread_ctx.session = make_session(primary_impersonate, proxy_url=proxy_url, timeout=timeout,
+                                       warm_up=(cookies is None), cookies=cookies, user_agent=user_agent)
     return _thread_ctx.session
+
+
+def upgrade_thread_session_with_cookies(args, cookies: List[Dict[str, Any]], user_agent: str):
+    """Replaces the current thread's curl_cffi session with one seeded by the stealth browser's
+    cookies (cf_clearance / __cf_bm) so subsequent links run on the fast path again."""
+    try:
+        reset_thread_session(args.impersonate, getattr(args, "resolved_proxy", None),
+                             timeout=getattr(args, "timeout", 20), cookies=cookies, user_agent=user_agent)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Stealth browser fallback (patchright / playwright driving system Chrome or Edge)
+#
+# When Cloudflare keeps challenging the datacenter IP after the fingerprint
+# rotation, the link is resolved with a real (stealth-patched) browser which
+# auto-solves the managed challenge, then the harvested cookies are injected
+# back into curl_cffi for the rest of the batch.
+#
+# Playwright's sync API is bound to the thread that started it, so the browser
+# runs on a dedicated daemon thread and work is submitted via a queue.
+# ---------------------------------------------------------------------------
+
+BROWSER_CHANNELS = ("chrome", "msedge")  # system browsers, no download needed
+CHALLENGE_TITLE_MARKERS = ("just a moment", "请稍候", "请稍后", "正在验证", "attention required",
+                           "checking your browser", "ddos protection")
+BROWSER_PROFILE_DIR = os.path.join(".temp", "bh_browser_profile")
+
+
+def browser_lib_available() -> bool:
+    return _BROWSER_LIB is not None
+
+
+def browser_fallback_enabled(args) -> bool:
+    return browser_lib_available() and not getattr(args, "no_browser_fallback", False)
+
+
+def is_block_error(e: BaseException) -> bool:
+    """True if the exception indicates a Cloudflare challenge / rate-limit (not a dead link)."""
+    s = str(e).lower()
+    return s.startswith("challenge") or s.startswith("rate_limited") or "cloudflare challenge" in s
+
+
+class BrowserSession:
+    """Singleton wrapper around a persistent stealth-browser context running on its own thread."""
+
+    _instance: Optional["BrowserSession"] = None
+    _instance_lock = threading.Lock()
+
+    def __init__(self):
+        self._thread: Optional[threading.Thread] = None
+        self._task_q: "queue.Queue" = queue.Queue()
+        self._context = None          # playwright BrowserContext (lives on the browser thread)
+        self._playwright = None       # playwright driver (lives on the browser thread)
+        self._launch_error: Optional[str] = None
+        self._poisoned = False
+        self.channel: Optional[str] = None
+        self.user_agent: Optional[str] = None
+        # Cloudflare's managed challenges do NOT reliably auto-solve in headless mode
+        # (verified experimentally); the fallback therefore runs HEADFUL by default.
+        # CI needs a virtual display: wrap with `xvfb-run -a` (preinstalled on GitHub runners).
+        self.headless = os.environ.get("BH_BROWSER_HEADLESS", "0").lower() in ("1", "true", "yes")
+        # Cache of the last solved challenge cookies so OTHER threads/links can reuse
+        # them on the curl fast path without re-launching the browser.
+        self.last_cookies: Optional[List[Dict[str, Any]]] = None
+        self.last_user_agent: Optional[str] = None
+
+    @classmethod
+    def get(cls) -> "BrowserSession":
+        with cls._instance_lock:
+            if cls._instance is None:
+                cls._instance = cls()
+            return cls._instance
+
+    # ---- task runner ------------------------------------------------------
+
+    def _ensure_thread(self):
+        if self._thread is None or not self._thread.is_alive():
+            self._thread = threading.Thread(target=self._run_loop, name="bh-browser", daemon=True)
+            self._thread.start()
+
+    def _run_loop(self):
+        while True:
+            fn, result_q = self._task_q.get()
+            if fn is None:  # shutdown sentinel
+                self._close_all()
+                result_q.put(("ok", True))
+                return
+            try:
+                result_q.put(("ok", fn()))
+            except Exception as e:  # noqa: BLE001 — propagate to caller
+                result_q.put(("err", e))
+
+    def submit(self, fn, timeout: float):
+        """Runs fn on the browser thread and returns its result (or raises its exception)."""
+        if self._poisoned:
+            raise TimeoutError("Browser fallback unavailable after a previous timeout.")
+        self._ensure_thread()
+        result_q: "queue.Queue" = queue.Queue(maxsize=1)
+        self._task_q.put((fn, result_q))
+        try:
+            status, payload = result_q.get(timeout=timeout)
+        except queue.Empty:
+            # The job may still hold the browser thread; mark as unusable for this process.
+            self._poisoned = True
+            raise TimeoutError(f"Browser fallback timed out after {timeout:.0f}s")
+        if status == "err":
+            raise payload
+        return payload
+
+    # ---- browser lifecycle (must be called on the browser thread) --------
+
+    def _ensure_context(self):
+        if self._context is not None:
+            return self._context
+        if self._launch_error:
+            raise RuntimeError(f"Browser launch previously failed: {self._launch_error}")
+        pw = _sync_playwright().start()
+        last_err = None
+        for channel in BROWSER_CHANNELS:
+            try:
+                kwargs: Dict[str, Any] = {
+                    "user_data_dir": os.path.abspath(BROWSER_PROFILE_DIR),
+                    "channel": channel,
+                    "headless": self.headless,
+                }
+                if not self.headless:
+                    kwargs["no_viewport"] = True
+                ctx = pw.chromium.launch_persistent_context(**kwargs)
+                self._playwright, self._context = pw, ctx
+                self.channel = channel
+                return ctx
+            except Exception as e:  # noqa: BLE001 — try next channel
+                last_err = e
+        self._launch_error = (f"No usable system Chromium browser (tried {list(BROWSER_CHANNELS)}): {last_err}")
+        try:
+            pw.stop()
+        except Exception:
+            pass
+        raise RuntimeError(self._launch_error)
+
+    def _close_all(self):
+        for closer in (lambda: self._context.close(), lambda: self._playwright.stop()):
+            try:
+                closer()
+            except Exception:
+                pass
+        self._context, self._playwright = None, None
+
+    # ---- challenge helpers ------------------------------------------------
+
+    @staticmethod
+    def _try_click_turnstile(page) -> bool:
+        """Best-effort click on the Turnstile checkbox for interactive challenges."""
+        try:
+            for frame in page.frames:
+                if "challenges.cloudflare.com" in (frame.url or ""):
+                    boxes = frame.locator("input[type=checkbox]")
+                    if boxes.count() > 0:
+                        boxes.first.click(timeout=3000)
+                        return True
+        except Exception:
+            pass
+        return False
+
+    def _wait_challenge_clear(self, page, timeout: float = 45.0) -> bool:
+        """Waits until the interstitial goes away (managed challenges auto-clear)."""
+        deadline = time.time() + timeout
+        clicked = False
+        content_markers = CF_MARKERS + ("请稍候", "正在验证")
+        while time.time() < deadline:
+            try:
+                title = (page.title() or "").lower()
+            except Exception:
+                title = "just a moment"
+            if not any(m in title for m in CHALLENGE_TITLE_MARKERS):
+                try:
+                    content = page.content().lower()
+                except Exception:
+                    content = ""
+                if not any(m in content for m in content_markers):
+                    return True
+            if not clicked:
+                self._try_click_turnstile(page)
+                clicked = True
+            time.sleep(0.7)
+        return False
+
+
+def _shutdown_browser():
+    try:
+        bs = BrowserSession._instance
+        if bs and bs._thread and bs._thread.is_alive():
+            result_q: "queue.Queue" = queue.Queue(maxsize=1)
+            bs._task_q.put((None, result_q))
+            try:
+                result_q.get(timeout=5)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+atexit.register(_shutdown_browser)
+
+
+def _browser_resolve_job(bs: "BrowserSession", file_id: str, timeout_s: float) -> Tuple[Dict[str, Any], List[Dict[str, Any]], str]:
+    """Runs ON the browser thread: opens the file page, waits out any Cloudflare
+    challenge, and resolves the token + CDN URL with an in-page fetch (so the request
+    carries the real browser fingerprint and cookies; the Node-side HTTP client is
+    NOT good enough — verified experimentally, it gets 403'd). Returns (result, cookies, UA)."""
+    ctx = bs._ensure_context()
+    page = ctx.new_page()
+    try:
+        page_url = f"{BASE_URL}/{file_id}"
+        page.goto(page_url, timeout=max(5000, int((timeout_s - 10) * 1000)))
+
+        # The challenge may auto-solve right AFTER the load event fires, so instead
+        # of a single check we poll until the htmx download button actually appears
+        # (re-waiting the challenge if it flares up again in between).
+        html = ""
+        hx_m = None
+        btn_re = re.compile(r'<a[^>]*hx-get=["\']([^"\']*download[^"\']*)["\'][^>]*>(.*?)</a>', re.DOTALL | re.IGNORECASE)
+        deadline = time.time() + max(15.0, timeout_s - 10.0)
+        while time.time() < deadline:
+            if not bs._wait_challenge_clear(page, timeout=max(5.0, timeout_s - 10.0)):
+                raise RuntimeError("Cloudflare challenge did not auto-clear in the stealth browser.")
+            html = page.content()
+            hx_m = btn_re.search(html)
+            if hx_m:
+                break
+            time.sleep(0.6)
+        if not hx_m:
+            raise RuntimeError("Could not find download link on page (browser path).")
+
+        cookies = ctx.cookies()
+        ua = page.evaluate("navigator.userAgent")
+        bs.user_agent = ua
+
+        result: Dict[str, Any] = {
+            "file_id": file_id,
+            "page_url": page_url,
+            "file_name": None,
+            "file_size": None,
+            "token_link": None,
+            "token": None,
+            "direct_cdn_url": None,
+            "fingerprint": f"browser:{bs.channel}",
+        }
+
+        title_m = re.search(r"<title>([^<]+)</title>", html, re.IGNORECASE)
+        if title_m:
+            t = title_m.group(1).strip()
+            if t not in ("Buzzheavier", "Just a moment...", "buzzheavier.com"):
+                result["file_name"] = t
+        hx_get = hx_m.group(1)
+        btn_text = hx_m.group(2)
+
+        size_m = re.search(r"([0-9.]+\s*(?:B|KB|MB|GB|TB))", btn_text, re.IGNORECASE)
+        if size_m:
+            result["file_size"] = size_m.group(1).strip()
+
+        token_link = f"{BASE_URL}{hx_get}" if hx_get.startswith("/") else hx_get
+        result["token_link"] = token_link
+        token_m = re.search(r"[?&]t=([^&]+)", hx_get)
+        if token_m:
+            result["token"] = token_m.group(1)
+
+        # Simulate the htmx click with an in-page same-origin fetch (real browser TLS + cookies).
+        # Reading the custom hx-redirect response header is allowed for same-origin requests.
+        fetch_out = page.evaluate(
+            """async (u) => {
+                try {
+                    const r = await fetch(u, {headers: {'HX-Request': 'true'}});
+                    const cd = r.headers.get('content-disposition') || '';
+                    return {status: r.status,
+                            hxRedirect: r.headers.get('hx-redirect'),
+                            location: r.headers.get('location'),
+                            contentDisposition: cd};
+                } catch (err) {
+                    return {status: 0, error: String(err)};
+                }
+            }""",
+            token_link,
+        )
+        if (fetch_out or {}).get("status") in (403, 429, 503):
+            raise RuntimeError(f"challenge during browser token step (HTTP {fetch_out['status']})")
+        direct = (fetch_out or {}).get("hxRedirect") or (fetch_out or {}).get("location")
+        if not _looks_like_cdn(direct):
+            raise RuntimeError("No direct CDN redirect found (browser path).")
+        result["direct_cdn_url"] = direct
+
+        if not result["file_name"]:
+            cd = (fetch_out or {}).get("contentDisposition", "")
+            cd_m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', cd)
+            if cd_m:
+                result["file_name"] = cd_m.group(1).strip()
+        return result, cookies, ua
+    finally:
+        try:
+            page.close()
+        except Exception:
+            pass
+
+
+def try_cached_cookie_fast_path(file_id: str, args) -> Optional[Dict[str, Any]]:
+    """If the stealth browser has already solved a challenge earlier in this run,
+    reuse its cached cookies on a curl_cffi session before spinning the browser up again."""
+    bs = BrowserSession.get()
+    cookies, ua = bs.last_cookies, bs.last_user_agent
+    if not cookies or not ua:
+        return None
+    try:
+        session = make_session(args.impersonate, proxy_url=getattr(args, "resolved_proxy", None),
+                               warm_up=False, cookies=cookies, user_agent=ua)
+        return resolve_buzzheavier_link(
+            file_id,
+            impersonate=args.impersonate,
+            timeout=getattr(args, "timeout", 20),
+            max_retries=0,
+            retry_delay=getattr(args, "retry_delay", 2.0),
+            session=session,
+            proxy_url=getattr(args, "resolved_proxy", None),
+        )
+    except Exception:
+        return None
+
+
+def attempt_browser_fallback(file_id: str, args, want_last_byte: bool, want_first_byte: bool) -> Dict[str, Any]:
+    """Resolves one link via the stealth browser and injects the harvested cookies into
+    the calling thread's curl_cffi session so later links run on the fast path again."""
+    bs = BrowserSession.get()
+    timeout = float(getattr(args, "browser_timeout", 90))
+
+    def job():
+        return _browser_resolve_job(bs, file_id, timeout)
+
+    result, cookies, ua = bs.submit(job, timeout=timeout + 30)
+
+    # Persist the challenge-solving cookies for the remainder of the batch
+    # (other threads may reuse them via try_cached_cookie_fast_path too).
+    bs.last_cookies, bs.last_user_agent = cookies, ua
+    upgrade_thread_session_with_cookies(args, cookies, ua)
+    print(f"    [*] Browser fallback resolved the link (channel={bs.channel}, UA={ua.split(')')[0][:40]}...); "
+          f"challenge cookies injected into the fast-path session.")
+    return result
+
+
+def browser_ping_byte(url: str, args, last: bool = True) -> bytes:
+    """Keep-alive byte ping via a curl_cffi session seeded with the stealth browser's
+    challenge cookies. If no cookies are cached yet, the browser first visits the
+    homepage to solve a challenge (the Node-side HTTP client gets 403'd, so the
+    ping itself must run through curl_cffi with the transferred cookies)."""
+    bs = BrowserSession.get()
+    timeout = float(getattr(args, "browser_timeout", 90))
+    proxy_url = getattr(args, "resolved_proxy", None)
+
+    if not (bs.last_cookies and bs.last_user_agent):
+        def warm_job():
+            ctx = bs._ensure_context()
+            page = ctx.new_page()
+            try:
+                page.goto(WARMUP_URL, timeout=max(5000, int((timeout - 10) * 1000)))
+                bs._wait_challenge_clear(page, timeout=max(5.0, timeout - 10.0))
+                return ctx.cookies(), page.evaluate("navigator.userAgent")
+            finally:
+                try:
+                    page.close()
+                except Exception:
+                    pass
+
+        cookies, ua = bs.submit(warm_job, timeout=timeout + 30)
+        bs.last_cookies, bs.last_user_agent = cookies, ua
+        upgrade_thread_session_with_cookies(args, cookies, ua)
+
+    session = make_session(args.impersonate, proxy_url=proxy_url, warm_up=False,
+                           cookies=bs.last_cookies, user_agent=bs.last_user_agent)
+    if last:
+        return download_last_byte(url, impersonate=args.impersonate, max_retries=1,
+                                  retry_delay=0.5, session=session, proxy_url=proxy_url)
+    return download_first_byte(url, impersonate=args.impersonate, max_retries=1,
+                               retry_delay=0.5, session=session, proxy_url=proxy_url)
 
 
 # ---------------------------------------------------------------------------
@@ -638,33 +1038,81 @@ def process_single_item(idx: int, total: int, line: str, args, log_lock: Optiona
             print(msg)
 
     if fresh_session:
-        session = reset_thread_session(args.impersonate, proxy_url, timeout=timeout)
+        # Prefer re-seeding with the browser's challenge cookies (if any were solved
+        # earlier in this run) over a completely fresh identity.
+        bs = BrowserSession.get()
+        if browser_fallback_enabled(args) and bs.last_cookies and bs.last_user_agent:
+            session = reset_thread_session(args.impersonate, proxy_url, timeout=timeout,
+                                            cookies=bs.last_cookies, user_agent=bs.last_user_agent)
+        else:
+            session = reset_thread_session(args.impersonate, proxy_url, timeout=timeout)
     else:
         session = get_thread_session(args.impersonate, proxy_url, timeout=timeout)
 
-    data = resolve_buzzheavier_link(
-        file_id,
-        impersonate=args.impersonate,
-        timeout=timeout,
-        max_retries=retries,
-        retry_delay=retry_delay,
-        session=session,
-        proxy_url=proxy_url,
-    )
+    browser_ready = browser_fallback_enabled(args)
+    method = "curl"
+
+    if getattr(args, "browser_only", False) and browser_ready:
+        log("    [*] --browser-only: resolving directly via stealth browser...")
+        data = attempt_browser_fallback(file_id, args, bool(args.last_byte), bool(args.first_byte))
+        method = "browser"
+        session = get_thread_session(args.impersonate, proxy_url, timeout=timeout)
+    else:
+        # Fast path. With the browser fallback available we fail fast into it
+        # instead of burning through the whole fingerprint rotation (all-403).
+        fast_retries = min(retries, 2) if browser_ready else retries
+        try:
+            data = resolve_buzzheavier_link(
+                file_id,
+                impersonate=args.impersonate,
+                timeout=timeout,
+                max_retries=fast_retries,
+                retry_delay=retry_delay,
+                session=session,
+                proxy_url=proxy_url,
+            )
+        except RuntimeError as e:
+            if browser_ready and is_block_error(e):
+                # If the browser already solved a challenge earlier in this run, retry
+                # the fast path with its cached cookies before spinning it up again.
+                cached = try_cached_cookie_fast_path(file_id, args)
+                if cached is not None:
+                    data = cached
+                    method = "browser-cookies"
+                    log("    [*] Recovered with cached challenge cookies (no browser relaunch needed).")
+                    session = get_thread_session(args.impersonate, proxy_url, timeout=timeout)
+                else:
+                    log("    [*] Persistent Cloudflare challenge. Falling back to stealth browser (" + _BROWSER_LIB + ")...")
+                    data = attempt_browser_fallback(file_id, args, bool(args.last_byte), bool(args.first_byte))
+                    method = "browser"
+                    # The thread session was upgraded with challenge cookies; refresh handle.
+                    session = get_thread_session(args.impersonate, proxy_url, timeout=timeout)
+            else:
+                raise
+
+    # Internal byte values possibly produced by the browser fallback
+    browser_last = data.pop("_last_byte", None) if isinstance(data, dict) else None
+    browser_first = data.pop("_first_byte", None) if isinstance(data, dict) else None
+
     file_name = data.get('file_name') or line
     file_size = data.get('file_size') or "N/A"
     log(f"    File     : {file_name} ({file_size})")
 
     byte_info = "-"
     if args.last_byte:
-        b = download_last_byte(
-            data["direct_cdn_url"],
-            impersonate=args.impersonate,
-            max_retries=retries,
-            retry_delay=retry_delay,
-            session=session,
-            proxy_url=proxy_url,
-        )
+        b = browser_last
+        if b is None:
+            b = download_last_byte(
+                data["direct_cdn_url"],
+                impersonate=args.impersonate,
+                max_retries=retries,
+                retry_delay=retry_delay,
+                session=session,
+                proxy_url=proxy_url,
+            )
+        if not b and browser_ready:
+            log("    [*] Byte ping failed on fast path; retrying via stealth browser...")
+            b = browser_ping_byte(data["direct_cdn_url"], args, last=True)
         if b:
             val = b[0]
             char_repr = repr(chr(val)) if 32 <= val <= 126 else repr(b)
@@ -674,14 +1122,18 @@ def process_single_item(idx: int, total: int, line: str, args, log_lock: Optiona
             raise RuntimeError("Failed to fetch last byte from CDN")
 
     if args.first_byte:
-        b = download_first_byte(
-            data["direct_cdn_url"],
-            impersonate=args.impersonate,
-            max_retries=retries,
-            retry_delay=retry_delay,
-            session=session,
-            proxy_url=proxy_url,
-        )
+        b = browser_first
+        if b is None:
+            b = download_first_byte(
+                data["direct_cdn_url"],
+                impersonate=args.impersonate,
+                max_retries=retries,
+                retry_delay=retry_delay,
+                session=session,
+                proxy_url=proxy_url,
+            )
+        if not b and browser_ready:
+            b = browser_ping_byte(data["direct_cdn_url"], args, last=False)
         if b:
             val = b[0]
             char_repr = repr(chr(val)) if 32 <= val <= 126 else repr(b)
@@ -689,8 +1141,12 @@ def process_single_item(idx: int, total: int, line: str, args, log_lock: Optiona
             log(f"    First Byte: {b} (Hex: 0x{val:02x}, Repr: {char_repr}) -> SUCCESS")
 
     if args.download:
-        download_file(data["direct_cdn_url"], output_path=args.output, impersonate=args.impersonate,
-                      proxy_url=proxy_url, session=session)
+        if method == "browser":
+            log("    [*] Direct CDN URL resolved via browser; use it with your download manager:")
+            log(f"        {data['direct_cdn_url']}")
+        else:
+            download_file(data["direct_cdn_url"], output_path=args.output, impersonate=args.impersonate,
+                          proxy_url=proxy_url, session=session)
 
     return {
         "idx": idx,
@@ -699,6 +1155,7 @@ def process_single_item(idx: int, total: int, line: str, args, log_lock: Optiona
         "name": file_name,
         "size": file_size,
         "byte": byte_info,
+        "method": method,
         "status": "✅ OK",
         "success": True,
         "error": None,
@@ -756,6 +1213,10 @@ def process_batch(file_path: str, args):
         print(f"  BATCH PROCESSING: {len(shard_items)} LINK(S)")
     print(f"  Pacing: {pace_delay}s delay | Workers: {workers} | Retries: {retries} | Retry Backoff: {retry_delay}s")
     print(f"  Fingerprint: {args.impersonate} (rotation list: {', '.join(build_candidate_targets(args.impersonate))})")
+    if browser_fallback_enabled(args):
+        print(f"  Browser fallback: enabled via {_BROWSER_LIB} (channel auto: {'/'.join(BROWSER_CHANNELS)})")
+    else:
+        print(f"  Browser fallback: disabled or unavailable ({'not installed' if not browser_lib_available() else 'flag'})")
     if getattr(args, "resolved_proxy", None):
         print(f"  Proxy: configured ({len(args.resolved_proxy)} chars, value hidden)")
     print("=" * 60)
@@ -1053,6 +1514,22 @@ def main():
         default=None,
         help="Maximum failure rate (0.0 - 1.0) allowed before exiting with code 1"
     )
+    parser.add_argument(
+        "--no-browser-fallback",
+        action="store_true",
+        help="Disable the stealth browser fallback (curl_cffi fast path only)"
+    )
+    parser.add_argument(
+        "--browser-only",
+        action="store_true",
+        help="Resolve directly via the stealth browser (skips the curl_cffi fast path)"
+    )
+    parser.add_argument(
+        "--browser-timeout",
+        type=int,
+        default=90,
+        help="Overall timeout in seconds for one stealth-browser fallback attempt (default: 90)"
+    )
 
     args = parser.parse_args()
 
@@ -1087,35 +1564,74 @@ def main():
         print(f"[*] Resolving via curl-cffi (impersonating {args.impersonate})...")
 
     session = get_thread_session(args.impersonate, args.resolved_proxy, timeout=args.timeout)
+    browser_ready = browser_fallback_enabled(args)
 
-    try:
-        data = resolve_buzzheavier_link(
-            file_id,
-            impersonate=args.impersonate,
-            timeout=args.timeout,
-            max_retries=args.retries,
-            retry_delay=args.retry_delay,
-            session=session,
-            proxy_url=args.resolved_proxy,
-        )
-    except Exception as e:
-        if args.json:
-            print(json.dumps({"error": str(e)}))
-        else:
-            print(f"[!] Failed to resolve link: {e}")
-        sys.exit(1)
+    if args.browser_only and browser_ready:
+        print("[*] --browser-only: resolving directly via stealth browser...")
+        try:
+            data = attempt_browser_fallback(file_id, args, bool(args.last_byte), bool(args.first_byte))
+        except Exception as e:
+            if args.json:
+                print(json.dumps({"error": str(e)}))
+            else:
+                print(f"[!] Failed to resolve link: {e}")
+            sys.exit(1)
+        session = get_thread_session(args.impersonate, args.resolved_proxy, timeout=args.timeout)
+    else:
+        fast_retries = min(args.retries, 2) if browser_ready else args.retries
+        try:
+            data = resolve_buzzheavier_link(
+                file_id,
+                impersonate=args.impersonate,
+                timeout=args.timeout,
+                max_retries=fast_retries,
+                retry_delay=args.retry_delay,
+                session=session,
+                proxy_url=args.resolved_proxy,
+            )
+        except Exception as e:
+            if browser_ready and is_block_error(e):
+                cached = try_cached_cookie_fast_path(file_id, args)
+                if cached is not None:
+                    data = cached
+                    print("[*] Recovered with cached challenge cookies (no browser relaunch needed).")
+                else:
+                    print("[*] Persistent Cloudflare challenge. Falling back to stealth browser (" + _BROWSER_LIB + ")...")
+                    try:
+                        data = attempt_browser_fallback(file_id, args, bool(args.last_byte), bool(args.first_byte))
+                    except Exception as e2:
+                        if args.json:
+                            print(json.dumps({"error": str(e2)}))
+                        else:
+                            print(f"[!] Failed to resolve link: {e2}")
+                        sys.exit(1)
+                # The thread session may have been upgraded with challenge cookies.
+                session = get_thread_session(args.impersonate, args.resolved_proxy, timeout=args.timeout)
+            else:
+                if args.json:
+                    print(json.dumps({"error": str(e)}))
+                else:
+                    print(f"[!] Failed to resolve link: {e}")
+                sys.exit(1)
+
+    browser_last = data.pop("_last_byte", None) if isinstance(data, dict) else None
+    browser_first = data.pop("_first_byte", None) if isinstance(data, dict) else None
 
     # If first-byte requested, fetch it
     first_byte_data = None
     if args.first_byte and data.get("direct_cdn_url"):
-        b = download_first_byte(
-            data["direct_cdn_url"],
-            impersonate=args.impersonate,
-            max_retries=args.retries,
-            retry_delay=args.retry_delay,
-            session=session,
-            proxy_url=args.resolved_proxy,
-        )
+        b = browser_first
+        if b is None:
+            b = download_first_byte(
+                data["direct_cdn_url"],
+                impersonate=args.impersonate,
+                max_retries=args.retries,
+                retry_delay=args.retry_delay,
+                session=session,
+                proxy_url=args.resolved_proxy,
+            )
+        if not b and browser_ready:
+            b = browser_ping_byte(data["direct_cdn_url"], args, last=False)
         if b:
             val = b[0]
             char_repr = repr(chr(val)) if 32 <= val <= 126 else repr(b)
@@ -1131,14 +1647,18 @@ def main():
     # If last-byte requested, fetch it
     last_byte_data = None
     if args.last_byte and data.get("direct_cdn_url"):
-        b = download_last_byte(
-            data["direct_cdn_url"],
-            impersonate=args.impersonate,
-            max_retries=args.retries,
-            retry_delay=args.retry_delay,
-            session=session,
-            proxy_url=args.resolved_proxy,
-        )
+        b = browser_last
+        if b is None:
+            b = download_last_byte(
+                data["direct_cdn_url"],
+                impersonate=args.impersonate,
+                max_retries=args.retries,
+                retry_delay=args.retry_delay,
+                session=session,
+                proxy_url=args.resolved_proxy,
+            )
+        if not b and browser_ready:
+            b = browser_ping_byte(data["direct_cdn_url"], args, last=True)
         if b:
             val = b[0]
             char_repr = repr(chr(val)) if 32 <= val <= 126 else repr(b)
