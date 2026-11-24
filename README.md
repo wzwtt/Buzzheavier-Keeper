@@ -112,10 +112,10 @@ python get_download_link.py yebbjo1kfx3b --json
 The repository includes a distributed GitHub Actions workflow in [`.github/workflows/daily_check.yml`](.github/workflows/daily_check.yml) optimized for large collections of links (800 to 5,000+ links).
 
 ### 🚀 Architecture Highlights:
-- **⚡ Parallel Matrix Sharding (5x–10x Speedup):** Automatically partitions `links.txt` across **5 parallel runner jobs** (configurable from 1 to 10 via manual trigger).
+- **🧮 Adaptive Shard Planning:** A planning job counts the unique links in `links.txt` and spawns exactly the number of runners the workload needs — `ceil(links / links_per_shard)`, capped at `max_shards`. **6 links → 1 runner** (no more 50-runner fleets for a handful of links); hundreds of links automatically scale up to the cap. The plan is published to the run's Step Summary.
 - **🌐 Distributed Multi-IP Requests:** Each GitHub Action runner executes on an independent VM with a distinct public IP address, eliminating Cloudflare rate limits and IP blocking.
 - **🎭 Stealth-Browser Fallback on every shard:** Persistent challenges are auto-solved with patchright + the runner's preinstalled Chrome under `xvfb-run` (Cloudflare managed challenges do not reliably auto-solve headless — verified experimentally), then solved cookies carry the rest of the shard at curl speed.
-- **🎲 Randomized Start Jitter:** Each shard sleeps a random 0–90s before starting so the runner fleet doesn't hit Cloudflare as a synchronized burst from adjacent Azure IP ranges.
+- **🎲 Fleet-Proportional Start Jitter:** Each shard sleeps a randomized 0–90s (scaled ~3s per shard in the fleet) before starting, so a large runner fleet doesn't hit Cloudflare as a synchronized burst from adjacent Azure IP ranges — while small runs stay fast.
 - **🧵 Non-Overlapping Runs:** A concurrency group prevents schedule/push/manual runs from stacking up.
 - **🛡️ Soft-Fail & Dead Link Isolation:** Dead/expired links (HTTP 404) are isolated into a downloadable `dead-links-report` workflow artifact instead of crashing the entire keep-alive workflow.
 - **📊 Consolidated Step Summary:** A final reporting job aggregates all shard outputs and publishes an overview dashboard with success rates, failed link tables, and collapsible sections.
@@ -136,7 +136,7 @@ GitHub runner IPs belong to a few well-known Azure datacenter ranges that Cloudf
    ```
 2. Commit and push your changes to GitHub.
 3. The workflow runs **every day at 03:00 UTC** (and on every push to `links.txt`).
-4. You can also trigger it manually from the **Actions** tab with custom shard counts (1, 3, 5, 8, 10), delay, worker threads, and soft-fail settings.
+4. You can also trigger it manually from the **Actions** tab: `max_shards` (runner-count cap, default 50), `links_per_shard` (planning target, default 25), delay, worker threads, retries, and soft-fail settings.
 5. Review the run dashboard and download `dead_links.txt` to remove expired files as needed.
 
 ---

@@ -6,18 +6,16 @@ on:
     - cron: '0 3,11,19 * * *'
   workflow_dispatch:
     inputs:
-      shards:
-        description: 'Number of parallel runner shards'
+      max_shards:
+        description: 'Upper bound of parallel runner shards (actual count adapts to link volume)'
         required: false
         default: '50'
-        type: choice
-        options:
-          - '1'
-          - '3'
-          - '5'
-          - '8'
-          - '10'
-          - '50'
+        type: string
+      links_per_shard:
+        description: 'Target number of links per runner when planning the matrix'
+        required: false
+        default: '25'
+        type: string
       delay:
         description: 'Pacing delay between requests per runner (seconds)'
         required: false
@@ -49,23 +47,70 @@ concurrency:
 
 jobs:
   init-matrix:
-    name: Initialize Parallel Runner Matrix
+    name: Plan Adaptive Shard Matrix
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
       total_shards: ${{ steps.set-matrix.outputs.total_shards }}
+      link_count: ${{ steps.set-matrix.outputs.link_count }}
     steps:
-      - name: Compute Shard Count
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Compute Adaptive Shard Count
         id: set-matrix
+        env:
+          MAX_SHARDS: ${{ inputs.max_shards || '50' }}
+          LINKS_PER_SHARD: ${{ inputs.links_per_shard || '25' }}
         run: |
-          SHARD_COUNT="${{ inputs.shards || '50' }}"
-          python -c "
-          import json
-          count = max(1, int('$SHARD_COUNT'))
-          shards = list(range(1, count + 1))
-          print(f'matrix={json.dumps(shards)}')
-          print(f'total_shards={count}')
-          " >> "$GITHUB_OUTPUT"
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, math, os, re
+
+          try:
+              max_shards = min(256, max(1, int(os.environ.get("MAX_SHARDS", "50") or "50")))
+          except ValueError:
+              max_shards = 50
+          try:
+              per_shard = max(1, int(os.environ.get("LINKS_PER_SHARD", "25") or "25"))
+          except ValueError:
+              per_shard = 25
+
+          # Count unique links exactly the way get_download_link.py does
+          # (strip comments/blank lines, dedupe by parsed file ID).
+          try:
+              raw = [l.strip() for l in open("links.txt", encoding="utf-8")]
+          except OSError:
+              raw = []
+          ids = set()
+          for line in raw:
+              if not line or line.startswith("#"):
+                  continue
+              m = re.search(r'(?:https?://(?:buzzheavier\.com|bzzhr\.to)/)?([a-zA-Z0-9]{8,16})', line)
+              ids.add(m.group(1) if m else line)
+
+          unique = len(ids)
+          if unique == 0:
+              total = 0
+          else:
+              # ceil(unique / per_shard), clamped to [1, max_shards]
+              total = min(max_shards, max(1, (unique + per_shard - 1) // per_shard))
+
+          print(f"matrix={json.dumps(list(range(1, total + 1)))}")
+          print(f"total_shards={total}")
+          print(f"link_count={unique}")
+          print(f"[plan] {unique} unique link(s) -> {total} runner(s) "
+                f"(target {per_shard} links/runner, cap {max_shards})")
+          PY
+
+      - name: Publish Sharding Plan to Step Summary
+        run: |
+          {
+            echo "### 🧮 Adaptive Sharding Plan"
+            echo ""
+            echo "- Unique links: **${{ steps.set-matrix.outputs.link_count }}**"
+            echo "- Links per runner (target): **${{ inputs.links_per_shard || '25' }}**"
+            echo "- Runners spawned: **${{ steps.set-matrix.outputs.total_shards }}** (cap ${{ inputs.max_shards || '50' }})"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   check-links:
     name: Shard ${{ matrix.shard }}
@@ -96,10 +141,15 @@ jobs:
 
       - name: Randomized Start Jitter
         run: |
-          # GitHub runners start in a synchronized burst on a few Azure IP ranges,
-          # which Cloudflare scores badly. Stagger each shard to spread the load.
-          JITTER=$((RANDOM % 90))
-          echo "Staggering shard start by ${JITTER}s"
+          # Synchronized starts from adjacent Azure IP ranges look like a burst to
+          # Cloudflare. Scale the stagger with the fleet size: up to 90s for a 50-
+          # shard fleet, only a few seconds for a small one (so tiny runs stay fast).
+          TOTAL_SHARDS="${{ needs.init-matrix.outputs.total_shards }}"
+          JITTER_MAX=$(( TOTAL_SHARDS * 3 ))
+          if [ "$JITTER_MAX" -gt 90 ]; then JITTER_MAX=90; fi
+          if [ "$JITTER_MAX" -lt 1 ]; then JITTER_MAX=1; fi
+          JITTER=$((RANDOM % JITTER_MAX))
+          echo "Staggering shard start by ${JITTER}s (max ${JITTER_MAX}s across ${TOTAL_SHARDS} shard(s))"
           sleep "$JITTER"
 
       - name: Run Shard Keep-Alive Check
