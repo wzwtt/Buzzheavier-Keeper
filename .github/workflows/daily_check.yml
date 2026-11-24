@@ -55,7 +55,7 @@ jobs:
       link_count: ${{ steps.set-matrix.outputs.link_count }}
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Compute Adaptive Shard Count
         id: set-matrix
@@ -129,10 +129,10 @@ jobs:
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
           cache: 'pip'
@@ -187,7 +187,7 @@ jobs:
 
       - name: Upload Shard Report Artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: shard-result-${{ matrix.shard }}
           path: reports/
@@ -200,15 +200,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
       - name: Download all Shard Artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: shard-result-*
           merge-multiple: true
@@ -221,7 +221,7 @@ jobs:
 
       - name: Upload Dead Links Report Artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dead-links-report
           path: dead_links.txt
