@@ -1,0 +1,27 @@
+name: Trigger Keep-Alive (links data branch)
+
+# This workflow lives on the `links` DATA branch (not main). Every push here that
+# changes links.txt immediately triggers the real keep-alive workflow on main,
+# so the "update links -> instant run" experience is preserved even though the
+# data no longer lives in the code branch.
+on:
+  push:
+    branches: [links]
+    paths: ['links.txt']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write   # required to dispatch a workflow via gh
+
+jobs:
+  trigger:
+    name: Dispatch main keep-alive workflow
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger daily_check.yml on main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run daily_check.yml --repo "$GITHUB_REPOSITORY" --ref main
+          echo "Keep-alive workflow dispatched on main (links data branch updated)."
