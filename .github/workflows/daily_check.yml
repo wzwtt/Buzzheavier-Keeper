@@ -36,9 +36,9 @@ on:
         required: false
         default: true
         type: boolean
-  push:
-    paths:
-      - 'links.txt' # Runs automatically when links.txt is updated
+  # NOTE: no push trigger on main — links.txt lives on the `links` data branch
+  # (orphan), and pushes there dispatch this workflow via that branch's own
+  # trigger-keepalive.yml. Schedule + manual dispatch cover everything else.
 
 # Avoid overlapping runs (schedule + push + manual) hammering the site at once
 concurrency:
@@ -56,6 +56,14 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v7
+
+      - name: Load links.txt from data branch
+        run: |
+          # links.txt is version-controlled on the orphan `links` branch so data
+          # updates never pollute the code history on main.
+          git fetch --depth=1 origin links
+          git show origin/links:links.txt > links.txt
+          echo "Loaded links.txt from the 'links' data branch ($(grep -cve '^\s*$' links.txt) non-empty lines)."
 
       - name: Compute Adaptive Shard Count
         id: set-matrix
@@ -89,7 +97,13 @@ jobs:
               if not line or line.startswith("#"):
                   continue
               m = re.search(r'(?:https?://(?:buzzheavier\.com|bzzhr\.to)/)?([a-zA-Z0-9]{8,16})', line)
-              ids.add(m.group(1) if m else line)
+              if m:
+                  ids.add(m.group(1))
+              else:
+                  # same junk-line skip as get_download_link.py
+                  cleaned = re.sub(r'[^a-zA-Z0-9]', '', line)
+                  if 8 <= len(cleaned) <= 16:
+                      ids.add(cleaned)
 
           unique = len(ids)
           if unique == 0:
@@ -130,6 +144,14 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v7
+
+      - name: Load links.txt from data branch
+        run: |
+          # links.txt is version-controlled on the orphan `links` branch so data
+          # updates never pollute the code history on main.
+          git fetch --depth=1 origin links
+          git show origin/links:links.txt > links.txt
+          echo "Loaded links.txt from the 'links' data branch."
 
       - name: Set up Python
         uses: actions/setup-python@v7

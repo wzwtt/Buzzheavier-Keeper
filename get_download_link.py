@@ -129,7 +129,10 @@ def parse_file_id(input_val: str) -> str:
     if match:
         return match.group(1)
     cleaned = re.sub(r'[^a-zA-Z0-9]', '', input_val)
-    if cleaned:
+    # Only accept IDs within the same length window as the URL capture, so junk
+    # lines (watermarks, notes, stray text) are rejected instead of being turned
+    # into bogus file IDs like "AI".
+    if cleaned and 8 <= len(cleaned) <= 16:
         return cleaned
     raise ValueError(f"Could not extract a valid file ID from: {input_val}")
 
@@ -1315,20 +1318,29 @@ def process_batch(file_path: str, args):
         print(f"[!] No valid links found in {file_path}")
         return
 
-    # Deduplicate while preserving order
+    # Deduplicate while preserving order; skip non-link junk lines (notes,
+    # watermarks, stray text) instead of turning them into bogus file IDs.
     seen_ids = set()
     unique_lines: List[str] = []
+    skipped_invalid = 0
     for line in raw_lines:
         try:
             fid = parse_file_id(line)
         except Exception:
-            fid = line
+            print(f"[!] Skipping invalid line (not a BuzzHeavier link/ID): {line[:60]}")
+            skipped_invalid += 1
+            continue
         if fid not in seen_ids:
             seen_ids.add(fid)
             unique_lines.append(line)
 
-    if len(unique_lines) < len(raw_lines):
-        print(f"[*] Deduplicated {len(raw_lines)} links -> {len(unique_lines)} unique links (removed {len(raw_lines) - len(unique_lines)} duplicates).")
+    if skipped_invalid:
+        print(f"[!] {skipped_invalid} invalid line(s) skipped.")
+    if not unique_lines:
+        print("[!] No valid links found after filtering.")
+        return
+    if len(unique_lines) < len(raw_lines) - skipped_invalid:
+        print(f"[*] Deduplicated {len(raw_lines) - skipped_invalid} link lines -> {len(unique_lines)} unique links (removed {len(raw_lines) - skipped_invalid - len(unique_lines)} duplicates).")
 
     # Shard partitioning
     shard_str = getattr(args, "shard", None)

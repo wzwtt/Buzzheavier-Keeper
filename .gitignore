@@ -7,3 +7,8 @@ all_reports/
 dead_links.txt
 test_shard*.json
 *.log
+
+# links.txt is version-controlled on the orphan `links` data branch (see README);
+# keep accidental data updates out of the code history on main.
+links.txt
+

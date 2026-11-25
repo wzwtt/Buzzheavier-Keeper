@@ -128,16 +128,29 @@ GitHub runner IPs belong to a few well-known Azure datacenter ranges that Cloudf
 2. **Second line — stealth-browser fallback** (built-in, automatic): after ~2 failed rotations the shard switches to patchright + system Chrome under `xvfb-run`, auto-solves the managed challenge, and transfers `cf_clearance` + UA back to curl_cffi so subsequent links stay fast.
 3. **Optional third line — residential proxy:** if the browser fallback is still not enough for your workload, add a cheap residential/ISP proxy: **Settings → Secrets and variables → Actions → New repository secret**, name it `PROXY_URL`, value e.g. `http://user:pass@proxy.example.com:8080`. Traffic is only a few KB per link per run, so a single static plan is plenty.
 
+### Where links.txt Lives (data branch)
+
+`links.txt` is version-controlled on the **orphan `links` branch**, not on `main`. Data-only updates therefore never pollute the code history, while the link list itself keeps full version control.
+
 ### How It Works:
-1. Add your file links to `links.txt` (one link per line):
+1. Add your file links to `links.txt` on the **`links` branch** (one link per line):
    ```text
    https://buzzheavier.com/1z8c4seiafor
    https://buzzheavier.com/yebbjo1kfx3b
    ```
-2. Commit and push your changes to GitHub.
-3. The workflow runs **every day at 03:00 UTC** (and on every push to `links.txt`).
+   The GitHub web-UI pencil editor on that branch works — commit, done. Locally:
+   ```bash
+   git switch links
+   # edit links.txt
+   git commit -am "add backup links"
+   git push origin links
+   ```
+2. A push that changes `links.txt` on the `links` branch auto-dispatches this workflow (the tiny `trigger-keepalive.yml` on that branch), preserving the "update links → instant run" experience.
+3. Scheduled runs happen **every 8 hours** (03:00 / 11:00 / 19:00 UTC) and always read the latest `links.txt` from the `links` branch.
 4. You can also trigger it manually from the **Actions** tab: `max_shards` (runner-count cap, default 50), `links_per_shard` (planning target, default 25), delay, worker threads, retries, and soft-fail settings.
-5. Review the run dashboard and download `dead_links.txt` to remove expired files as needed.
+5. Review the run dashboard and download `dead_links.txt` to remove expired files as needed (prune them on the `links` branch).
+
+> `links.txt` is also listed in `.gitignore` **on main**, so accidental data commits can't creep back into the code branch.
 
 ---
 
